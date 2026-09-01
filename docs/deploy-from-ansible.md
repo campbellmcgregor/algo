@@ -45,13 +45,13 @@ Cloud roles:
 - role: cloud-ec2,          [provider: ec2](#amazon-ec2)
 - role: cloud-gce,          [provider: gce](#google-compute-engine)
 - role: cloud-vultr,        [provider: vultr](#vultr)
-- role: cloud-azure,        [provider: azure](#azure)
-- role: cloud-lightsail,    [provider: lightsail](#lightsail)
 - role: cloud-scaleway,     [provider: scaleway](#scaleway)
 - role: cloud-openstack,    [provider: openstack](#openstack)
 - role: cloud-cloudstack,   [provider: cloudstack](#cloudstack)
 - role: cloud-hetzner,      [provider: hetzner](#hetzner)
 - role: cloud-linode,       [provider: linode](#linode)
+
+Azure and Lightsail are excluded and unverified in this release. Their legacy role documentation is retained below only as historical migration context; selecting either provider is rejected before provisioning.
 
 Server roles:
 
@@ -67,7 +67,7 @@ Server roles:
   - Adds a restricted `algo` group with no shell access and limited SSH forwarding options
   - Creates one limited, local account and an SSH public key for each user
 - role: wireguard
-  - Installs a [Wireguard](https://www.wireguard.com/) server, with a startup script, and automatic checks for upgrades
+  - Install a [Wireguard](https://www.wireguard.com/) server, with a startup script, and automatic checks for upgrades
   - Creates wireguard.conf files for Linux clients as well as QR codes for Apple/Android clients
 
 Note: The `strongswan` role generates Apple profiles with On-Demand Wifi and Cellular if you pass the following variables:
@@ -80,7 +80,7 @@ Note: The `strongswan` role generates Apple profiles with On-Demand Wifi and Cel
 
 - role: local, provider: local
 
-This role is intended to be run for local install onto an Ubuntu server, or onto an unsupported cloud provider's Ubuntu instance. Required variables:
+This role is intended to be run for local installation onto an Ubuntu server, or onto an unsupported cloud provider's Ubuntu instance. Required variables:
 
 - server - IP address of your server (or "localhost" if deploying to the local machine)
 - endpoint - public IP address of the server you're installing on
@@ -111,17 +111,21 @@ Possible options can be gathered via cli `aws ec2 describe-regions`
 Additional variables:
 
 - [encrypted](https://aws.amazon.com/blogs/aws/new-encrypted-ebs-boot-volumes/) - Encrypted EBS boot volume. Boolean (Default: true)
-- [size](https://aws.amazon.com/ec2/instance-types/) - EC2 instance type. String (Default: t2.micro)
-- [image](https://awscli.amazonaws.com/v2/documentation/api/latest/reference/ec2/describe-images.html) - AMI `describe-images` search parameters to find the OS for the hosted image. Each OS and architecture has a unique AMI-ID. The OS owner, for example [Ubuntu](https://cloud-images.ubuntu.com/locator/ec2/), updates these images often. If parameters below result in multiple results, the most recent AMI-ID is chosen
+- [size](https://aws.amazon.com/ec2/instance-types/) - EC2 instance type. String (Default: t3.micro)
+- [image](https://awscli.amazonaws.com/v2/documentation/api/latest/reference/ec2/describe-images.html) - AMI `describe-images` search parameters to find the OS for the hosted image. Each OS and architecture has a unique AMI-ID. The OS owner, for example, [Ubuntu](https://cloud-images.ubuntu.com/locator/ec2/), updates these images often. If parameters below result in multiple results, the most recent AMI-ID is chosen
 
    ```
    # Example of equivalent cli command
-   aws ec2 describe-images --owners "099720109477" --filters "Name=architecture,Values=arm64" "Name=name,Values=ubuntu/images/hvm-ssd/ubuntu-jammy-22.04*"
+   # Ubuntu 22.04
+   aws ec2 describe-images --owners "099720109477" --filters "Name=architecture,Values=x86_64" "Name=name,Values=ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"
+
+   # Ubuntu 24.04 (selector only; cloud support remains gated by credentialed canaries)
+   aws ec2 describe-images --owners "099720109477" --filters "Name=architecture,Values=x86_64" "Name=name,Values=ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"
    ```
 
   - [owners] - The operating system owner id. Default is [Canonical](https://help.ubuntu.com/community/EC2StartersGuide#Official_Ubuntu_Cloud_Guest_Amazon_Machine_Images_.28AMIs.29) (Default: 099720109477)
   - [arch] - The architecture (Default: x86_64, Optional: arm64)
-  - [name] - The wildcard string to filter available ami names. Algo appends this name with the string "-\*64-server-\*", and prepends with "ubuntu/images/hvm-ssd/" (Default: Ubuntu latest LTS)
+  - [name] - A release-indexed map selected by `ubuntu_version`. Algo appends `-*64-server-*` to the configured full prefix. The transition default is Ubuntu 22.04 (`ubuntu/images/hvm-ssd/ubuntu-jammy-22.04`); the staged Ubuntu 24.04 selector is `ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04` and must not be advertised as cloud-verified until credentialed canaries pass.
 - [instance_market_type](https://aws.amazon.com/ec2/pricing/) - Two pricing models are supported: on-demand and spot. String (Default: on-demand)
   - If using spot instance types, one additional IAM permission along with the below minimum is required for deployment:
 
@@ -215,7 +219,7 @@ Required variables:
 - [vultr_config](https://trailofbits.github.io/algo/cloud-vultr.html): /path/to/.vultr.ini
 - [region](https://api.vultr.com/v1/regions/list): e.g. `Chicago`, `'New Jersey'`
 
-### Azure
+### Azure (excluded and unverified)
 
 Required variables:
 
@@ -225,7 +229,7 @@ Required variables:
 - azure_subscription_id
 - [region](https://azure.microsoft.com/en-us/global-infrastructure/regions/)
 
-### Lightsail
+### Lightsail (excluded and unverified)
 
 Required variables:
 
@@ -291,11 +295,13 @@ You need to source the rc file prior to run Algo. Download it from the OpenStack
 
 ### CloudStack
 
+> **Note:** Exoscale is no longer supported as they deprecated their CloudStack API on May 1, 2024.
+
 Required variables:
 
 - [cs_config](https://trailofbits.github.io/algo/cloud-cloudstack.html): /path/to/.cloudstack.ini
-- cs_region: e.g. `exoscale`
-- cs_zones: e.g. `ch-gva2`
+- cs_region: your CloudStack region
+- cs_zones: your CloudStack zone
 
 The first two can also be defined in your environment, using the variables `CLOUDSTACK_CONFIG` and `CLOUDSTACK_REGION`.
 

@@ -1,16 +1,14 @@
 ---
-- name: Build python virtual environment
-  import_tasks: venv.yml
-
 - name: Include prompts
   import_tasks: prompts.yml
 
 - name: Network configured
   gcp_compute_network:
-    auth_kind: serviceaccount
-    service_account_file: "{{ credentials_file_path }}"
+    auth_kind: "{{ gce_auth_kind_effective }}"
+    service_account_file: "{{ omit if gce_auth_kind_effective == 'application' else credentials_file_path }}"
     project: "{{ project_id }}"
     name: algovpn
+    description: "{{ ('algo-canary-owner=' ~ algo_canary_owner) if algo_canary_owner is defined else omit }}"
     auto_create_subnetworks: true
     routing_config:
       routing_mode: REGIONAL
@@ -18,28 +16,30 @@
 
 - name: Firewall configured
   gcp_compute_firewall:
-    auth_kind: serviceaccount
-    service_account_file: "{{ credentials_file_path }}"
+    auth_kind: "{{ gce_auth_kind_effective }}"
+    service_account_file: "{{ omit if gce_auth_kind_effective == 'application' else credentials_file_path }}"
     project: "{{ project_id }}"
     name: algovpn
+    description: "{{ ('algo-canary-owner=' ~ algo_canary_owner) if algo_canary_owner is defined else omit }}"
     network: "{{ gcp_compute_network }}"
     direction: INGRESS
-    allowed:
-      - ip_protocol: udp
-        ports:
-          - "500"
-          - "4500"
-          - "{{ wireguard_port|string }}"
-      - ip_protocol: tcp
-        ports:
-          - "{{ ssh_port }}"
-      - ip_protocol: icmp
+    allowed: >-
+      {{
+        [{'ip_protocol': 'tcp', 'ports': [ssh_port | string]}, {'ip_protocol': 'icmp'}]
+        + ([{
+          'ip_protocol': 'udp',
+          'ports':
+            (['500', '4500'] if ipsec_enabled | bool else [])
+            + ([wireguard_port | string] if wireguard_enabled | bool else [])
+        }] if ipsec_enabled | bool or wireguard_enabled | bool else [])
+      }}
 
-- block:
+- when: cloud_providers.gce.external_static_ip
+  block:
     - name: External IP allocated
       gcp_compute_address:
-        auth_kind: serviceaccount
-        service_account_file: "{{ credentials_file_path }}"
+        auth_kind: "{{ gce_auth_kind_effective }}"
+        service_account_file: "{{ omit if gce_auth_kind_effective == 'application' else credentials_file_path }}"
         project: "{{ project_id }}"
         name: "{{ algo_server_name }}"
         region: "{{ algo_region }}"
@@ -48,12 +48,11 @@
     - name: Set External IP as a fact
       set_fact:
         external_ip: "{{ gcp_compute_address.address }}"
-  when: cloud_providers.gce.external_static_ip
 
 - name: Instance created
   gcp_compute_instance:
-    auth_kind: serviceaccount
-    service_account_file: "{{ credentials_file_path }}"
+    auth_kind: "{{ gce_auth_kind_effective }}"
+    service_account_file: "{{ omit if gce_auth_kind_effective == 'application' else credentials_file_path }}"
     project: "{{ project_id }}"
     name: "{{ algo_server_name }}"
     zone: "{{ algo_zone }}"
@@ -62,7 +61,7 @@
       - auto_delete: true
         boot: true
         initialize_params:
-          source_image: projects/ubuntu-os-cloud/global/images/family/{{ cloud_providers.gce.image }}
+          source_image: projects/ubuntu-os-cloud/global/images/family/{{ cloud_providers.gce.image[ubuntu_version] }}
     metadata:
       ssh-keys: algo:{{ ssh_public_key_lookup }}
       user-data: "{{ lookup('template', 'files/cloud-init/base.yml') }}"
@@ -70,11 +69,12 @@
       - network: "{{ gcp_compute_network }}"
         access_configs:
           - name: "{{ algo_server_name }}"
-            nat_ip: "{{ gcp_compute_address|default(None) }}"
+            nat_ip: "{{ gcp_compute_address | default(None) }}"
             type: ONE_TO_ONE_NAT
     tags:
       items:
         - environment-algo
+    labels: "{{ {'algo-canary-owner': algo_canary_owner} if algo_canary_owner is defined else omit }}"
   register: gcp_compute_instance
 
 - set_fact:

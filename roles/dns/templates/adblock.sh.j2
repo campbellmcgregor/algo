@@ -5,7 +5,7 @@ TEMP="$(mktemp)"
 TEMP_SORTED="$(mktemp)"
 WHITELIST="/etc/dnscrypt-proxy/white.list"
 BLACKLIST="/etc/dnscrypt-proxy/black.list"
-BLOCKHOSTS="{{ config_prefix|default('/') }}etc/dnscrypt-proxy/blacklist.txt"
+BLOCKHOSTS="{{ config_prefix | default('/') }}etc/dnscrypt-proxy/blacklist.txt"
 BLOCKLIST_URLS="{% for url in adblock_lists %}{{ url }} {% endfor %}"
 
 #Delete the old block.hosts to make room for the updates
@@ -37,6 +37,9 @@ then
 else
     cat "$TEMP_SORTED" > $BLOCKHOSTS
 fi
+
+# dnscrypt-proxy runs unprivileged; do not inherit a restrictive caller umask.
+chmod 0644 "$BLOCKHOSTS"
 
 echo 'Restarting dns service...'
 #Restart the dns service

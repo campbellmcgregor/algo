@@ -2,12 +2,18 @@
 - name: Include prompts
   import_tasks: prompts.yml
 
-- block:
+- environment:
+    VULTR_API_KEY: "{{ lookup('ini', 'key', section='default', file=algo_vultr_config) }}"
+  block:
+    - name: Set cloud-init script as fact
+      set_fact:
+        algo_cloud_init_script: "{{ lookup('template', 'files/cloud-init/base.yml') }}"
+
     - name: Creating a firewall group
       vultr.cloud.firewall_group:
         name: "{{ algo_server_name }}"
 
-    - name: Creating firewall rules
+    - name: Creating enabled firewall rules
       vultr.cloud.firewall_rule:
         group: "{{ algo_server_name }}"
         protocol: "{{ item.protocol }}"
@@ -15,28 +21,60 @@
         ip_type: "{{ item.ip }}"
         subnet: "{{ item.cidr.split('/')[0] }}"
         subnet_size: "{{ item.cidr.split('/')[1] }}"
-      with_items:
-        - { protocol: tcp, port: "{{ ssh_port }}", ip: v4, cidr: 0.0.0.0/0 }
-        - { protocol: tcp, port: "{{ ssh_port }}", ip: v6, cidr: "::/0" }
-        - { protocol: udp, port: 500, ip: v4, cidr: 0.0.0.0/0 }
-        - { protocol: udp, port: 500, ip: v6, cidr: "::/0" }
-        - { protocol: udp, port: 4500, ip: v4, cidr: 0.0.0.0/0 }
-        - { protocol: udp, port: 4500, ip: v6, cidr: "::/0" }
-        - { protocol: udp, port: "{{ wireguard_port }}", ip: v4, cidr: 0.0.0.0/0 }
-        - { protocol: udp, port: "{{ wireguard_port }}", ip: v6, cidr: "::/0" }
+      loop: >-
+        {{
+          [
+            {'protocol': 'tcp', 'port': ssh_port, 'ip': 'v4', 'cidr': '0.0.0.0/0'},
+            {'protocol': 'tcp', 'port': ssh_port, 'ip': 'v6', 'cidr': '::/0'}
+          ]
+          + ([
+            {'protocol': 'udp', 'port': 500, 'ip': 'v4', 'cidr': '0.0.0.0/0'},
+            {'protocol': 'udp', 'port': 500, 'ip': 'v6', 'cidr': '::/0'},
+            {'protocol': 'udp', 'port': 4500, 'ip': 'v4', 'cidr': '0.0.0.0/0'},
+            {'protocol': 'udp', 'port': 4500, 'ip': 'v6', 'cidr': '::/0'}
+          ] if ipsec_enabled | bool else [])
+          + ([
+            {'protocol': 'udp', 'port': wireguard_port, 'ip': 'v4', 'cidr': '0.0.0.0/0'},
+            {'protocol': 'udp', 'port': wireguard_port, 'ip': 'v6', 'cidr': '::/0'}
+          ] if wireguard_enabled | bool else [])
+        }}
+
+    - name: Removing disabled protocol firewall rules
+      vultr.cloud.firewall_rule:
+        group: "{{ algo_server_name }}"
+        protocol: udp
+        port: "{{ item.port }}"
+        ip_type: "{{ item.ip }}"
+        subnet: "{{ item.cidr.split('/')[0] }}"
+        subnet_size: "{{ item.cidr.split('/')[1] }}"
+        state: absent
+      loop: >-
+        {{
+          ([
+            {'port': 500, 'ip': 'v4', 'cidr': '0.0.0.0/0'},
+            {'port': 500, 'ip': 'v6', 'cidr': '::/0'}
+          ] if not ipsec_enabled | bool and (not wireguard_enabled | bool or wireguard_port | int != 500) else [])
+          + ([
+            {'port': 4500, 'ip': 'v4', 'cidr': '0.0.0.0/0'},
+            {'port': 4500, 'ip': 'v6', 'cidr': '::/0'}
+          ] if not ipsec_enabled | bool and (not wireguard_enabled | bool or wireguard_port | int != 4500) else [])
+          + ([
+            {'port': wireguard_port, 'ip': 'v4', 'cidr': '0.0.0.0/0'},
+            {'port': wireguard_port, 'ip': 'v6', 'cidr': '::/0'}
+          ] if not wireguard_enabled | bool and (not ipsec_enabled | bool or wireguard_port | int not in [500, 4500]) else [])
+        }}
 
     - name: Upload the startup script
       vultr.cloud.startup_script:
         name: algo-startup
-        script: |
-          {{ lookup('template', 'files/cloud-init/base.yml') }}
+        script: "{{ algo_cloud_init_script }}"
 
     - name: Creating a server
       vultr.cloud.instance:
         name: "{{ algo_server_name }}"
         startup_script: algo-startup
         hostname: "{{ algo_server_name }}"
-        os: "{{ cloud_providers.vultr.os }}"
+        os: "{{ cloud_providers.vultr.os[ubuntu_version] }}"
         plan: "{{ cloud_providers.vultr.size }}"
         region: "{{ algo_vultr_region }}"
         firewall_group: "{{ algo_server_name }}"
@@ -53,6 +91,3 @@
         ansible_ssh_user: algo
         ansible_ssh_port: "{{ ssh_port }}"
         cloudinit: true
-
-  environment:
-    VULTR_API_KEY: "{{ lookup('ini', 'key', section='default', file=algo_vultr_config) }}"

@@ -1,40 +1,92 @@
 #!/usr/bin/env sh
 
-set -ex
+set -eu
 
-METHOD="${1:-${METHOD:-cloud}}"
-ONDEMAND_CELLULAR="${2:-${ONDEMAND_CELLULAR:-false}}"
-ONDEMAND_WIFI="${3:-${ONDEMAND_WIFI:-false}}"
-ONDEMAND_WIFI_EXCLUDE="${4:-${ONDEMAND_WIFI_EXCLUDE:-_null}}"
-STORE_PKI="${5:-${STORE_PKI:-false}}"
-DNS_ADBLOCKING="${6:-${DNS_ADBLOCKING:-false}}"
-SSH_TUNNELING="${7:-${SSH_TUNNELING:-false}}"
-ENDPOINT="${8:-${ENDPOINT:-localhost}}"
-USERS="${9:-${USERS:-user1}}"
-REPO_SLUG="${10:-${REPO_SLUG:-trailofbits/algo}}"
-REPO_BRANCH="${11:-${REPO_BRANCH:-master}}"
-EXTRA_VARS="${12:-${EXTRA_VARS:-placeholder=null}}"
-ANSIBLE_EXTRA_ARGS="${13:-${ANSIBLE_EXTRA_ARGS}}"
+UV_VERSION="0.12.3"
+UV_INSTALLER_SHA256="a7e3924ea1cd06bf1518c577d635c624ae2e2db030e0fc8ff8cf426224384e17"
 
-cd /opt/
+verify_sha256() {
+  file="$1"
+  expected="$2"
+  printf '%s  %s\n' "$expected" "$file" | sha256sum --check
+}
+
+cleanup_uv_installer() {
+  if [ -n "${uv_installer:-}" ]; then
+    rm -f "$uv_installer"
+  fi
+}
+
+if [ "$#" -ne 0 ]; then
+  echo "Error: positional arguments are not supported; use environment variables instead." >&2
+  exit 2
+fi
+
+METHOD="${METHOD:-cloud}"
+ONDEMAND_CELLULAR="${ONDEMAND_CELLULAR:-false}"
+ONDEMAND_WIFI="${ONDEMAND_WIFI:-false}"
+ONDEMAND_WIFI_EXCLUDE="${ONDEMAND_WIFI_EXCLUDE:-_null}"
+STORE_PKI="${STORE_PKI:-false}"
+DNS_ADBLOCKING="${DNS_ADBLOCKING:-false}"
+SSH_TUNNELING="${SSH_TUNNELING:-false}"
+ENDPOINT="${ENDPOINT:-localhost}"
+USERS="${USERS:-user1}"
+REPO_SLUG="${REPO_SLUG:-trailofbits/algo}"
+REPO_BRANCH="${REPO_BRANCH:-main}"
+EXTRA_VARS="${EXTRA_VARS:-placeholder=null}"
+ANSIBLE_EXTRA_ARGS="${ANSIBLE_EXTRA_ARGS:-}"
+
+case "$METHOD" in
+  cloud | local) ;;
+  *)
+    echo "Error: METHOD must be 'cloud' or 'local'." >&2
+    exit 2
+    ;;
+esac
+
+if [ -z "$REPO_SLUG" ] || [ -z "$REPO_BRANCH" ] || [ -z "$USERS" ]; then
+  echo "Error: REPO_SLUG, REPO_BRANCH, and USERS must not be empty." >&2
+  exit 2
+fi
 
 installRequirements() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
-  apt-get install \
-    python3-virtualenv \
-    jq -y
+  apt-get install -y \
+    curl \
+    git \
+    jq
+
+  # Install a pinned uv release after verifying the published installer digest.
+  uv_installer="$(mktemp)"
+  trap cleanup_uv_installer 0
+  trap 'exit 1' 1 2 15
+  if ! curl --proto '=https' --tlsv1.2 --fail --location --show-error \
+    "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-installer.sh" \
+    --output "$uv_installer"; then
+    rm -f "$uv_installer"
+    return 1
+  fi
+  if ! verify_sha256 "$uv_installer" "$UV_INSTALLER_SHA256"; then
+    rm -f "$uv_installer"
+    return 1
+  fi
+  if ! sh "$uv_installer"; then
+    rm -f "$uv_installer"
+    return 1
+  fi
+  rm -f "$uv_installer"
+  uv_installer=""
+  trap - 0 1 2 15
+  export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 }
 
 getAlgo() {
-  [ ! -d "algo" ] && git clone "https://github.com/${REPO_SLUG}" -b "${REPO_BRANCH}" algo
-  cd algo
+  [ ! -d /opt/algo ] && git clone --branch "${REPO_BRANCH}" "https://github.com/${REPO_SLUG}.git" /opt/algo
+  cd /opt/algo
 
-  python3 -m virtualenv --python="$(command -v python3)" .env
-  # shellcheck source=/dev/null
-  . .env/bin/activate
-  python3 -m pip install -U pip virtualenv
-  python3 -m pip install -r requirements.txt
+  # uv handles all dependency installation automatically
+  uv sync
 }
 
 publicIpFromInterface() {
@@ -45,15 +97,47 @@ publicIpFromInterface() {
   echo "Using ${ENDPOINT} as the endpoint"
 }
 
+tryGetMetadata() {
+  # Helper function to fetch metadata with retry
+  url="$1"
+  headers="$2"
+  response=""
+
+  # Try up to 2 times
+  for attempt in 1 2; do
+    if [ -n "$headers" ]; then
+      response="$(curl -s --connect-timeout 5 --max-time "${METADATA_TIMEOUT}" -H "$headers" "$url" || true)"
+    else
+      response="$(curl -s --connect-timeout 5 --max-time "${METADATA_TIMEOUT}" "$url" || true)"
+    fi
+
+    # If we got a response, return it
+    if [ -n "$response" ]; then
+      echo "$response"
+      return 0
+    fi
+
+    # Wait before retry (only on first attempt)
+    [ $attempt -eq 1 ] && sleep 2
+  done
+
+  # Return empty string if all attempts failed
+  echo ""
+  return 1
+}
+
 publicIpFromMetadata() {
-  if curl -s http://169.254.169.254/metadata/v1/vendor-data | grep DigitalOcean >/dev/null; then
-    ENDPOINT="$(curl -s http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address)"
-  elif test "$(curl -s http://169.254.169.254/latest/meta-data/services/domain)" = "amazonaws.com"; then
-    ENDPOINT="$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)"
+  # Set default timeout from environment or use 20 seconds
+  METADATA_TIMEOUT="${METADATA_TIMEOUT:-20}"
+
+  if tryGetMetadata "http://169.254.169.254/metadata/v1/vendor-data" "" | grep DigitalOcean >/dev/null; then
+    ENDPOINT="$(tryGetMetadata "http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address" "")"
+  elif test "$(tryGetMetadata "http://169.254.169.254/latest/meta-data/services/domain" "")" = "amazonaws.com"; then
+    ENDPOINT="$(tryGetMetadata "http://169.254.169.254/latest/meta-data/public-ipv4" "")"
   elif host -t A -W 10 metadata.google.internal 127.0.0.53 >/dev/null; then
-    ENDPOINT="$(curl -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip")"
-  elif test "$(curl -s -H Metadata:true 'http://169.254.169.254/metadata/instance/compute/publisher/?api-version=2017-04-02&format=text')" = "Canonical"; then
-    ENDPOINT="$(curl -H Metadata:true 'http://169.254.169.254/metadata/instance/network/interface/0/ipv4/ipAddress/0/publicIpAddress?api-version=2017-04-02&format=text')"
+    ENDPOINT="$(tryGetMetadata "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip" "Metadata-Flavor: Google")"
+  elif test "$(tryGetMetadata "http://169.254.169.254/metadata/instance/compute/publisher/?api-version=2017-04-02&format=text" "Metadata:true")" = "Canonical"; then
+    ENDPOINT="$(tryGetMetadata "http://169.254.169.254/metadata/instance/network/interface/0/ipv4/ipAddress/0/publicIpAddress?api-version=2017-04-02&format=text" "Metadata:true")"
   fi
 
   if echo "${ENDPOINT}" | grep -oE "\b([0-9]{1,3}\.){3}[0-9]{1,3}\b"; then
@@ -68,15 +152,13 @@ deployAlgo() {
   getAlgo
 
   cd /opt/algo
-  # shellcheck source=/dev/null
-  . .env/bin/activate
 
   export HOME=/root
   export ANSIBLE_LOCAL_TEMP=/root/.ansible/tmp
   export ANSIBLE_REMOTE_TEMP=/root/.ansible/tmp
 
   # shellcheck disable=SC2086
-  ansible-playbook main.yml \
+  uv run ansible-playbook main.yml \
     -e provider=local \
     -e "ondemand_cellular=${ONDEMAND_CELLULAR}" \
     -e "ondemand_wifi=${ONDEMAND_WIFI}" \
@@ -89,8 +171,8 @@ deployAlgo() {
     -e server=localhost \
     -e ssh_user=root \
     -e "${EXTRA_VARS}" \
-    --skip-tags debug ${ANSIBLE_EXTRA_ARGS} |
-      tee /var/log/algo.log
+    --skip-tags debug ${ANSIBLE_EXTRA_ARGS} \
+    -e algo_no_log=true
 }
 
 if test "$METHOD" = "cloud"; then

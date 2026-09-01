@@ -1,0 +1,321 @@
+"""Policy guardrails for the privileged IPsec tunnel integration test."""
+
+import subprocess
+from pathlib import Path
+
+import yaml
+
+ROOT = Path(__file__).parents[2]
+E2E_SCRIPT = ROOT / "tests/e2e/test-vpn-connectivity.sh"
+WORKFLOW = ROOT / ".github/workflows/integration-tests.yml"
+XFRM_COUNTER = ROOT / "tests/e2e/xfrm-byte-count.awk"
+
+
+def _script() -> str:
+    return E2E_SCRIPT.read_text(encoding="utf-8")
+
+
+def test_ipsec_e2e_runs_an_isolated_swanctl_client_and_requires_both_sas():
+    script = _script()
+
+    assert E2E_SCRIPT.stat().st_mode & 0o111, "E2E script must be directly executable"
+
+    assert 'ip netns exec "${NAMESPACE}"' in script
+    assert "unshare --mount --pid --fork --kill-child --mount-proc" in script
+    assert "mount -t tmpfs" in script and "tmpfs /run" in script
+    assert "charon" in script
+    assert '"${IPSEC_SWANCTL_BINARY}" --load-all' in script
+    assert '"${IPSEC_SWANCTL_BINARY}" --initiate' in script
+    assert '"${IPSEC_SWANCTL_BINARY}" --list-sas' in script
+    assert 'grep -q "ESTABLISHED"' in script
+    assert 'grep -q "INSTALLED"' in script
+    assert "Full tunnel test requires" not in script
+
+
+def test_ipsec_client_uses_a_private_executable_path_outside_host_apparmor_attachment():
+    script = _script()
+
+    assert 'install -m 0700 "${charon_binary}" "${IPSEC_CLIENT_DIR}/charon-client"' in script
+    assert 'charon_binary="${IPSEC_CLIENT_DIR}/charon-client"' in script
+    assert "command -v charon" not in script
+    assert 'stat -c "%u" -- "${candidate}"' in script
+    assert 'stat -c "%a" -- "${candidate}"' in script
+    assert '|| -L "${candidate}"' in script
+
+
+def test_ipsec_client_uses_a_private_swanctl_path_outside_host_apparmor_attachment():
+    script = _script()
+
+    assert 'install -m 0700 "${swanctl_binary}" "${IPSEC_CLIENT_DIR}/swanctl-client"' in script
+    assert 'IPSEC_SWANCTL_BINARY="${IPSEC_CLIENT_DIR}/swanctl-client"' in script
+    assert 'ip netns exec "${NAMESPACE}" swanctl --' not in script
+
+
+def test_ipsec_client_strongswan_config_uses_parser_safe_dynamic_values():
+    script = _script()
+
+    assert "${charon_log} {" not in script
+    assert "stderr {" in script
+    assert 'socket = "unix://${vici_socket}"' in script
+
+
+def test_ipsec_e2e_proves_dns_and_routed_source_ip_through_the_tunnel():
+    script = _script()
+
+    assert 'ip netns exec "${NAMESPACE}" dig' in script
+    assert 'dig -b "${ipsec_virtual_ip}"' in script
+    assert "curl --ipv4 --noproxy '*'" in script
+    assert '--interface "${ipsec_virtual_ip}"' in script
+    assert '--resolve "${public_ip_host}:443:${public_endpoint_ipv4}"' in script
+    assert script.count("--noproxy '*'") >= 2
+    assert script.count("--ipv4") >= 2
+    assert 'ip netns exec "${NAMESPACE}" curl' in script
+    assert "VPN source IP does not match server source IP" in script
+    assert "remote_ts = 0.0.0.0/0" in script
+
+
+def test_ipsec_client_populates_swanctl_credential_directories():
+    script = _script()
+
+    assert 'install -d -m 0700 "${IPSEC_CLIENT_DIR}/x509"' in script
+    assert '"${IPSEC_CLIENT_DIR}/x509ca"' in script
+    assert '"${IPSEC_CLIENT_DIR}/private"' in script
+    assert 'install -m 0600 "${user_cert}" "${IPSEC_CLIENT_DIR}/x509/client.crt"' in script
+    assert 'install -m 0600 "${cacert}" "${IPSEC_CLIENT_DIR}/x509ca/cacert.pem"' in script
+    assert 'install -m 0600 "${user_key}" "${IPSEC_CLIENT_DIR}/private/client.key"' in script
+
+
+def test_ipsec_client_credentials_are_private_and_torn_down():
+    script = _script()
+
+    assert "umask 077" in script
+    assert 'chmod 700 "${IPSEC_CLIENT_DIR}"' in script
+    assert '"${IPSEC_SWANCTL_BINARY}" --terminate' in script
+    assert 'kill "${IPSEC_CLIENT_PID}"' in script
+    assert 'rm -rf "${IPSEC_CLIENT_DIR}"' in script
+    assert "set -x" not in script
+
+
+def test_ipsec_initiation_failure_prints_sanitized_client_diagnostics():
+    script = _script()
+    initiate_failure = script.split('log_error "swanctl failed to initiate the IPsec tunnel"', 1)[1].split(
+        "return 1", 1
+    )[0]
+
+    assert "print_ipsec_client_log" in initiate_failure
+    assert "<redacted-client-dir>" in script
+
+
+def test_ipsec_client_shutdown_is_bounded_and_escalates_if_needed():
+    script = _script()
+
+    assert "stop_ipsec_client()" in script
+    assert 'kill -KILL "${IPSEC_CLIENT_PID}"' in script
+    assert "for _ in 1 2 3 4 5; do" in script
+    assert script.count('wait "${IPSEC_CLIENT_PID}"') == 1
+
+
+def test_ipsec_e2e_preserves_signal_failure_status():
+    script = _script()
+
+    assert "trap cleanup EXIT INT TERM" not in script
+    assert "trap cleanup EXIT" in script
+    assert "trap 'exit 130' INT" in script
+    assert "trap 'exit 143' TERM" in script
+    assert "trap - EXIT INT TERM" in script
+    assert 'exit "${exit_code}"' in script
+
+
+def test_ipsec_e2e_proves_traffic_with_xfrm_packet_counters():
+    script = _script()
+
+    assert "xfrm_bytes_before" in script
+    assert "xfrm_bytes_after" in script
+    assert "((xfrm_bytes_after > xfrm_bytes_before))" in script
+
+
+def test_xfrm_counter_parses_single_and_two_line_iproute2_formats():
+    fixture = """\
+lifetime current: 20124(bytes), 83(packets)
+lifetime current:
+  100(bytes), 2(packets)
+"""
+    result = subprocess.run(
+        ["awk", "-f", str(XFRM_COUNTER)],
+        input=fixture,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    assert result.stdout.strip() == "20224"
+
+
+def test_security_sensitive_tests_are_not_called_in_errexit_disabling_or_lists():
+    script = _script()
+
+    assert "test_ipsec ||" not in script
+    assert "test_wireguard ||" not in script
+    assert "if ! test_ipsec" not in script
+    assert "if ! test_wireguard" not in script
+    assert 'rm -rf "${IPSEC_CLIENT_DIR}" || return 1' in script
+    assert "((failed++))" not in script
+    assert "((attempts++))" not in script
+
+
+def test_public_ip_url_is_https_only_and_ends_curl_option_parsing():
+    script = _script()
+
+    assert 'if [[ "${PUBLIC_IP_URL}" != https://* ]]' in script
+    assert script.count('-- "${PUBLIC_IP_URL}"') == 2
+
+
+def test_privileged_temporary_files_are_unique_private_and_pid_tracked():
+    script = _script()
+
+    assert "WG_CONFIG_FILE=$(mktemp /tmp/algo-test-wg.XXXXXX.conf)" in script
+    assert "TCPDUMP_LOG=$(mktemp /tmp/algo-tcpdump.XXXXXX.log)" in script
+    assert 'chmod 600 "${WG_CONFIG_FILE}" "${TCPDUMP_LOG}"' in script
+    assert "TCPDUMP_PID=$!" in script
+    assert 'pkill -f "tcpdump.*port 51820"' not in script
+    assert "algo-test-wg.conf" not in script
+    assert "algo-tcpdump.log" not in script
+
+
+def test_harness_refuses_preexisting_namespace_and_tags_its_firewall_rules():
+    script = _script()
+
+    setup = script.split("setup_namespace() {", 1)[1].split("# Create namespace", 1)[0]
+    assert "Refusing to delete pre-existing namespace" in setup
+    assert 'ip netns del "${NAMESPACE}"' not in setup
+    assert "/proc/sys/kernel/random/uuid" in script
+    assert 'RULE_COMMENT="algo-e2e-${RULE_UUID}"' in script
+    assert script.count('-m comment --comment "${RULE_COMMENT}"') >= 8
+
+
+def test_cleanup_discovers_exact_owned_network_resources_without_racy_flags():
+    script = _script()
+    setup = script.split("setup_namespace() {", 1)[1].split("# Mobileconfig Validation", 1)[0]
+    cleanup = script.split("cleanup() {", 1)[1].split("trap cleanup EXIT", 1)[0]
+
+    flags = (
+        "NAMESPACE_CREATED",
+        "VETH_CREATED",
+        "NAT_RULE_ADDED",
+        "WG_RULE_ADDED",
+        "IKE_RULE_ADDED",
+        "NATT_RULE_ADDED",
+    )
+    assert not [flag for flag in flags if flag in setup or flag in cleanup]
+    assert "iptables -t nat -C POSTROUTING" not in cleanup
+    assert "iptables -C INPUT" not in cleanup
+    assert "iptables -t nat -D POSTROUTING" in cleanup
+    assert cleanup.count("iptables -D INPUT") == 3
+    assert 'grep -q "^${NAMESPACE}\\b" <<< "${existing_namespaces}"' in cleanup
+    assert '[[ -e "/sys/class/net/${VETH_SERVER}" ]]' in cleanup
+
+
+def test_cleanup_is_armed_only_after_preexisting_resources_are_rejected():
+    script = _script()
+    setup = script.split("setup_namespace() {", 1)[1].split("# Mobileconfig Validation", 1)[0]
+    cleanup = script.split("cleanup() {", 1)[1].split("trap cleanup EXIT", 1)[0]
+
+    refusal = setup.index('if [[ -e "/sys/class/net/${VETH_SERVER}" ]]')
+    armed = setup.index("NETWORK_CLEANUP_ARMED=true")
+    mutation = setup.index('ip netns add "${NAMESPACE}"')
+    assert refusal < armed < mutation
+    assert 'if [[ "${NETWORK_CLEANUP_ARMED}" == true ]]' in cleanup
+    assert "if ! existing_namespaces=$(ip netns list); then" in setup
+    assert '[[ -e "/sys/class/net/${VETH_SERVER}" ]]' in setup
+
+
+def test_host_wide_sysctl_mutations_are_serialized_until_restoration():
+    script = _script()
+    main = script.split("main() {", 1)[1].split('main "$@"', 1)[0]
+    cleanup = script.split("cleanup() {", 1)[1].split("trap cleanup EXIT", 1)[0]
+
+    assert 'HOST_STATE_LOCK="/run/algo-e2e-host-state.lock"' in script
+    assert "/run/lock/algo-e2e-host-state.lock" not in script
+    assert 'flock "${HOST_STATE_LOCK_FD}"' in main
+    assert main.index('flock "${HOST_STATE_LOCK_FD}"') < main.index("setup_namespace")
+    assert cleanup.index('sysctl -w net.ipv4.ip_forward="${ORIGINAL_IP_FORWARD}"') < cleanup.index(
+        'flock -u "${HOST_STATE_LOCK_FD}"'
+    )
+
+
+def test_cleanup_failures_for_secret_files_and_owned_namespace_propagate():
+    script = _script()
+    cleanup = script.split("cleanup() {", 1)[1].split("trap cleanup EXIT", 1)[0]
+
+    assert 'rm -f "${WG_CONFIG_FILE}" "${TCPDUMP_LOG}" || exit_code=1' in cleanup
+    assert 'if rm -rf "${IPSEC_CLIENT_DIR}"; then' in cleanup
+    assert "else\n            exit_code=1" in cleanup
+    assert 'grep -q "^${NAMESPACE}\\b" <<< "${existing_namespaces}"' in cleanup
+    assert 'ip netns del "${NAMESPACE}" 2>/dev/null || exit_code=1' in cleanup
+
+
+def test_privileged_network_sysctls_are_restored_on_exit():
+    script = _script()
+
+    assert "ORIGINAL_IP_FORWARD" in script
+    assert "ORIGINAL_RP_FILTER_ALL" in script
+    assert 'sysctl -w net.ipv4.ip_forward="${ORIGINAL_IP_FORWARD}"' in script
+    assert 'sysctl -w net.ipv4.conf.all.rp_filter="${ORIGINAL_RP_FILTER_ALL}"' in script
+
+
+def test_cleanup_discovers_and_removes_only_rules_with_the_run_ownership_tag():
+    script = _script()
+    cleanup = script.split("cleanup() {", 1)[1].split("trap cleanup EXIT", 1)[0]
+
+    assert "NAT_RULE_ADDED" not in script
+    assert "WG_RULE_ADDED" not in script
+    assert "IKE_RULE_ADDED" not in script
+    assert "NATT_RULE_ADDED" not in script
+    assert "iptables -t nat -C POSTROUTING" not in cleanup
+    assert "iptables -C INPUT" not in cleanup
+    assert "iptables -t nat -D POSTROUTING" in script
+    assert "iptables -D INPUT" in script
+    assert not any("iptables" in line and "|| true" in line for line in cleanup.splitlines())
+
+
+def test_cleanup_deletes_exact_owned_firewall_rules_without_ambiguous_probes():
+    cleanup = _script().split("cleanup() {", 1)[1].split("trap cleanup EXIT", 1)[0]
+
+    assert "iptables_check_status" not in cleanup
+    assert cleanup.count("|| exit_code=1") >= 8
+
+
+def test_server_ipsec_cli_is_optional_for_swanctl_backend():
+    script = _script()
+    prerequisite_loop = next(line for line in script.splitlines() if line.strip().startswith("for cmd in "))
+
+    assert " ipsec " not in f" {prerequisite_loop} "
+    assert "ipsec statusall || true" in script
+
+
+def test_integration_workflow_installs_and_exercises_swanctl_without_exporting_credentials():
+    workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    job = workflow["jobs"]["localhost-deployment"]
+    serialized = yaml.safe_dump(job)
+
+    assert "strongswan-swanctl" in serialized
+    assert "libcharon-extra-plugins" in serialized
+    assert "libxml2-utils" in serialized
+    assert "tests/e2e/test-vpn-connectivity.sh" in serialized
+    assert "algo_no_log: true" in serialized
+    assert "test-ca-password" not in serialized
+    assert "test-p12-password" not in serialized
+    assert "openssl rand -hex" in serialized
+    assert "rm -f integration-test.cfg" in serialized
+    deployment_step = next(step for step in job["steps"] if step.get("name") == "Run Algo deployment")
+    assert "-vv" not in deployment_step["run"]
+    assert "cat configs/" not in serialized
+    artifact_paths = [
+        step.get("with", {}).get("path", "")
+        for step in job["steps"]
+        if "actions/upload-artifact@" in step.get("uses", "")
+    ]
+    assert all("configs/" not in path for path in artifact_paths)
+    pull_request_paths = workflow["on"]["pull_request"]["paths"]
+    assert ".github/workflows/integration-tests.yml" in pull_request_paths
+    assert "tests/e2e/**" in pull_request_paths

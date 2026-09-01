@@ -6,8 +6,7 @@
 
 - name: Install prerequisites
   package: name="{{ item }}" state=present
-  with_items:
-    - "{{ prerequisites }}"
+  loop: "{{ prerequisites }}"
   register: result
   until: result is succeeded
   retries: 10
@@ -25,8 +24,6 @@
     src: roles/strongswan/templates/client_ipsec.conf.j2
     dest: "{{ configs_prefix }}/ipsec.{{ IP_subject_alt_name }}.conf"
     mode: "0644"
-  with_items:
-    - "{{ vpn_user }}"
   notify:
     - restart strongswan
 
@@ -35,8 +32,6 @@
     src: roles/strongswan/templates/client_ipsec.secrets.j2
     dest: "{{ configs_prefix }}/ipsec.{{ IP_subject_alt_name }}.secrets"
     mode: "0600"
-  with_items:
-    - "{{ vpn_user }}"
   notify:
     - restart strongswan
 
@@ -45,11 +40,14 @@
     dest: "{{ item.dest }}"
     line: "{{ item.line }}"
     create: true
-  with_items:
+    mode: "{{ item.mode }}"
+  loop:
     - dest: "{{ configs_prefix }}/ipsec.conf"
       line: include ipsec.{{ IP_subject_alt_name }}.conf
+      mode: '0644'
     - dest: "{{ configs_prefix }}/ipsec.secrets"
       line: include ipsec.{{ IP_subject_alt_name }}.secrets
+      mode: '0600'
   notify:
     - restart strongswan
 
@@ -59,18 +57,22 @@
     dest: "{{ configs_prefix }}/strongswan.d/relax-ca-constraints.conf"
     owner: root
     group: root
-    mode: 0644
+    mode: '0644'
 
 - name: Setup the certificates and keys
   template:
     src: "{{ item.src }}"
     dest: "{{ item.dest }}"
-  with_items:
+    mode: "{{ item.mode }}"
+  loop:
     - src: configs/{{ IP_subject_alt_name }}/ipsec/.pki/certs/{{ vpn_user }}.crt
       dest: "{{ configs_prefix }}/ipsec.d/certs/{{ vpn_user }}.crt"
+      mode: '0644'
     - src: configs/{{ IP_subject_alt_name }}/ipsec/.pki/cacert.pem
       dest: "{{ configs_prefix }}/ipsec.d/cacerts/{{ IP_subject_alt_name }}.pem"
+      mode: '0644'
     - src: configs/{{ IP_subject_alt_name }}/ipsec/.pki/private/{{ vpn_user }}.key
       dest: "{{ configs_prefix }}/ipsec.d/private/{{ vpn_user }}.key"
+      mode: '0600'
   notify:
     - restart strongswan

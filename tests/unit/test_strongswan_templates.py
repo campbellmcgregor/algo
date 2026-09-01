@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+"""
+Enhanced tests for StrongSwan templates.
+Tests all strongswan role templates with various configurations.
+"""
+
+import os
+import sys
+import uuid
+from pathlib import Path
+
+import pytest
+import yaml
+from jinja2 import Environment, FileSystemLoader, StrictUndefined
+
+# Add parent directory to path for fixtures
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from fixtures import load_test_variables
+
+
+def mock_to_uuid(value):
+    """Mock the to_uuid filter"""
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, str(value)))
+
+
+def mock_bool(value):
+    """Mock the bool filter"""
+    return str(value).lower() in ("true", "1", "yes", "on")
+
+
+def mock_version(version_string, comparison):
+    """Mock the version comparison filter"""
+    # Simple mock - just return True for now
+    return True
+
+
+def mock_b64encode(value):
+    """Mock base64 encoding"""
+    import base64
+
+    if isinstance(value, str):
+        value = value.encode("utf-8")
+    return base64.b64encode(value).decode("ascii")
+
+
+def mock_b64decode(value):
+    """Mock base64 decoding"""
+    import base64
+
+    return base64.b64decode(value).decode("utf-8")
+
+
+def get_strongswan_test_variables(scenario="default"):
+    """Get test variables for StrongSwan templates with different scenarios."""
+    base_vars = load_test_variables()
+
+    # Add StrongSwan specific variables
+    strongswan_vars = {
+        "ipsec_config_path": "/etc/ipsec.d",
+        "ipsec_pki_path": "/etc/ipsec.d",
+        "strongswan_enabled": True,
+        "strongswan_network": "10.19.48.0/24",
+        "strongswan_network_ipv6": "fd9d:bc11:4021::/64",
+        "strongswan_log_level": "2",
+        "openssl_constraint_random_id": "test-" + str(uuid.uuid4()),
+        "subjectAltName": "IP:10.0.0.1,IP:2600:3c01::f03c:91ff:fedf:3b2a",
+        "subjectAltName_type": "IP",
+        "subjectAltName_client": "IP:10.0.0.1",
+        "ansible_default_ipv6": {"address": "2600:3c01::f03c:91ff:fedf:3b2a"},
+        "openssl_version": "3.0.0",
+        "p12_export_password": "test-password",
+        "ike_lifetime": "24h",
+        "ipsec_lifetime": "8h",
+        "ike_dpd": "30s",
+        "ipsec_dead_peer_detection": True,
+        "rekey_margin": "3m",
+        "rekeymargin": "3m",
+        "dpddelay": "35s",
+        "keyexchange": "ikev2",
+        "ike_cipher": "aes128gcm16-prfsha512-ecp256",
+        "esp_cipher": "aes128gcm16-ecp256",
+        "leftsourceip": "10.19.48.1",
+        "leftsubnet": "0.0.0.0/0,::/0",
+        "rightsourceip": "10.19.48.2/24,fd9d:bc11:4021::2/64",
+    }
+
+    # Merge with base variables
+    test_vars = {**base_vars, **strongswan_vars}
+
+    # Apply scenario-specific overrides
+    if scenario == "ipv4_only":
+        test_vars["ipv6_support"] = False
+        test_vars["subjectAltName"] = "IP:10.0.0.1"
+        test_vars["ansible_default_ipv6"] = None
+    elif scenario == "dns_hostname":
+        test_vars["IP_subject_alt_name"] = "vpn.example.com"
+        test_vars["subjectAltName"] = "DNS:vpn.example.com"
+        test_vars["subjectAltName_type"] = "DNS"
+    elif scenario == "openssl_legacy":
+        test_vars["openssl_version"] = "1.1.1"
+
+    return test_vars
+
+
+def test_strongswan_templates():
+    """Test all StrongSwan templates with various configurations."""
+    templates = [
+        "roles/strongswan/templates/ipsec.conf.j2",
+        "roles/strongswan/templates/ipsec.secrets.j2",
+        "roles/strongswan/templates/strongswan.conf.j2",
+        "roles/strongswan/templates/charon.conf.j2",
+        "roles/strongswan/templates/client_ipsec.conf.j2",
+        "roles/strongswan/templates/client_ipsec.secrets.j2",
+        "roles/strongswan/templates/100-CustomLimitations.conf.j2",
+    ]
+
+    scenarios = ["default", "ipv4_only", "dns_hostname", "openssl_legacy"]
+    errors = []
+    tested = 0
+
+    for template_path in templates:
+        if not os.path.exists(template_path):
+            print(f"  ⚠️  Skipping {template_path} (not found)")
+            continue
+
+        template_dir = os.path.dirname(template_path)
+        template_name = os.path.basename(template_path)
+
+        for scenario in scenarios:
+            tested += 1
+            test_vars = get_strongswan_test_variables(scenario)
+
+            try:
+                env = Environment(loader=FileSystemLoader(template_dir), undefined=StrictUndefined)
+
+                # Add mock filters
+                env.filters["to_uuid"] = mock_to_uuid
+                env.filters["bool"] = mock_bool
+                env.filters["b64encode"] = mock_b64encode
+                env.filters["b64decode"] = mock_b64decode
+                env.tests["version"] = mock_version
+
+                # For client templates, add item context
+                if "client" in template_name:
+                    test_vars["item"] = "testuser"
+
+                template = env.get_template(template_name)
+                output = template.render(**test_vars)
+
+                # Basic validation
+                assert len(output) > 0, f"Empty output from {template_path} ({scenario})"
+
+                # Specific validations based on template
+                if "ipsec.conf" in template_name and "client" not in template_name:
+                    assert "conn" in output, "Missing connection definition"
+                    if scenario != "ipv4_only" and test_vars.get("ipv6_support"):
+                        assert "::/0" in output or "fd9d:bc11" in output, "Missing IPv6 configuration"
+
+                if "ipsec.secrets" in template_name:
+                    assert "PSK" in output or "ECDSA" in output, "Missing authentication method"
+
+                if "strongswan.conf" in template_name:
+                    assert "charon" in output, "Missing charon configuration"
+
+                print(f"  ✅ {template_name} ({scenario})")
+
+            except Exception as e:
+                errors.append(f"{template_path} ({scenario}): {e!s}")
+                print(f"  ❌ {template_name} ({scenario}): {e!s}")
+
+    assert not errors, "StrongSwan template errors:\n" + "\n".join(errors[:5])
+    print(f"\n✅ All StrongSwan template tests passed ({tested} tests)")
+
+
+def test_strongswan_systemd_hardening_and_restart_lifecycle():
+    template = Path("roles/strongswan/templates/100-CustomLimitations.conf.j2").read_text(encoding="utf-8")
+    handlers = yaml.safe_load(Path("roles/strongswan/handlers/main.yml").read_text(encoding="utf-8"))
+    ubuntu_tasks = Path("roles/strongswan/tasks/ubuntu.yml").read_text(encoding="utf-8")
+
+    assert "AF_UNIX" in template
+    assert "ReadOnlyPaths=/proc/net/pfkey" not in template
+    assert "ProtectSystem=strict" in template
+    assert "ReadWritePaths=/var/lib/strongswan" in template
+    assert "ReadWritePaths=/etc/ipsec.d" not in template
+    assert "/etc/swanctl" not in next(line for line in template.splitlines() if line.startswith("ReadWritePaths="))
+
+    combined = next(item for item in handlers if item["name"] == "reload systemd and restart strongswan")
+    systemd = combined["systemd"]
+    assert systemd["name"] == "{{ strongswan_service }}"
+    assert systemd["daemon_reload"] is True
+    assert systemd["state"] == "restarted"
+
+    assert "- daemon-reload" not in ubuntu_tasks
+    assert "notify: restart strongswan" not in ubuntu_tasks
+    assert "- restart strongswan" not in ubuntu_tasks
+    assert "reload systemd and restart strongswan" in ubuntu_tasks
+
+
+def test_strongswan_harness_uses_a_transient_unit():
+    harness = Path("tests/integration/test-strongswan-systemd.sh").read_text(encoding="utf-8")
+
+    assert "systemd-run" in harness
+    assert "systemd_properties" in harness
+    assert "algo-strongswan-hardening-test.service" not in harness
+
+
+def test_strongswan_harness_preserves_signal_failure_status():
+    harness = Path("tests/integration/test-strongswan-systemd.sh").read_text(encoding="utf-8")
+
+    assert "trap cleanup EXIT INT TERM" not in harness
+    assert "trap cleanup EXIT" in harness
+    assert "trap 'exit 130' INT" in harness
+    assert "trap 'exit 143' TERM" in harness
+    assert "local status=$?" in harness
+    assert 'exit "${status}"' in harness
+
+
+def test_openssl_template_constraints():
+    """Test the OpenSSL task template that had the inline comment issue."""
+    # This tests the actual openssl.yml task file to ensure our fix works
+    import yaml
+
+    openssl_path = "roles/strongswan/tasks/openssl.yml"
+    if not os.path.exists(openssl_path):
+        pytest.skip("OpenSSL tasks file not found")
+
+    try:
+        with open(openssl_path) as f:
+            content = yaml.safe_load(f)
+
+        # Find the CA CSR task
+        ca_csr_task = None
+        for task in content:
+            if isinstance(task, dict) and task.get("name", "").startswith("Create certificate signing request"):
+                ca_csr_task = task
+                break
+
+        if ca_csr_task:
+            # Check that name_constraints_permitted is properly formatted
+            csr_module = ca_csr_task.get("community.crypto.openssl_csr_pipe", {})
+            constraints = csr_module.get("name_constraints_permitted", "")
+
+            # The constraints should be a Jinja2 template without inline comments
+            if "#" in str(constraints):
+                # Check if the # is within {{ }}
+                import re
+
+                jinja_blocks = re.findall(r"\{\{.*?\}\}", str(constraints), re.DOTALL)
+                for block in jinja_blocks:
+                    if "#" in block:
+                        raise AssertionError("Found inline comment in Jinja2 expression")
+
+        print("✅ OpenSSL template constraints validated")
+
+    except Exception as e:
+        raise AssertionError(f"Error checking OpenSSL tasks: {e}") from e
+
+
+def test_mobileconfig_template():
+    """Test the mobileconfig template with various scenarios."""
+    template_path = "roles/strongswan/templates/mobileconfig.j2"
+
+    if not os.path.exists(template_path):
+        pytest.skip("Mobileconfig template not found")
+
+    test_cases = [
+        {
+            "name": "iPhone with cellular on-demand",
+            "algo_ondemand_cellular": True,
+            "algo_ondemand_wifi": False,
+            "algo_ondemand_wifi_exclude": "X251bGw=",
+        },
+        {
+            "name": "iPad with WiFi on-demand",
+            "algo_ondemand_cellular": False,
+            "algo_ondemand_wifi": True,
+            "algo_ondemand_wifi_exclude": "TXlIb21lTmV0d29yayxPZmZpY2VXaUZp",
+        },
+        {
+            "name": "Mac without on-demand",
+            "algo_ondemand_cellular": False,
+            "algo_ondemand_wifi": False,
+            "algo_ondemand_wifi_exclude": "X251bGw=",
+        },
+    ]
+
+    errors = []
+    for test_case in test_cases:
+        test_vars = get_strongswan_test_variables()
+        test_vars.update(test_case)
+
+        # Mock Ansible task result format for item
+        class MockTaskResult:
+            def __init__(self, content):
+                self.stdout = content
+
+        test_vars["item"] = ("testuser", MockTaskResult("TU9DS19QS0NTMTJfQ09OVEVOVA=="))  # Tuple with mock result
+        test_vars["PayloadContentCA_base64"] = "TU9DS19DQV9DRVJUX0JBU0U2NA=="  # Valid base64
+        test_vars["PayloadContentUser_base64"] = "TU9DS19VU0VSX0NFUlRfQkFTRTY0"  # Valid base64
+        test_vars["pkcs12_PayloadCertificateUUID"] = str(uuid.uuid4())
+        test_vars["PayloadContent"] = "TU9DS19QS0NTMTJfQ09OVEVOVA=="  # Valid base64 for PKCS12
+        test_vars["algo_server_name"] = "test-algo-vpn"
+        test_vars["VPN_PayloadIdentifier"] = str(uuid.uuid4())
+        test_vars["CA_PayloadIdentifier"] = str(uuid.uuid4())
+        test_vars["PayloadContentCA"] = "TU9DS19DQV9DRVJUX0NPTlRFTlQ="  # Valid base64
+
+        try:
+            env = Environment(loader=FileSystemLoader("roles/strongswan/templates"), undefined=StrictUndefined)
+
+            # Add mock filters
+            env.filters["to_uuid"] = mock_to_uuid
+            env.filters["b64encode"] = mock_b64encode
+            env.filters["b64decode"] = mock_b64decode
+            env.filters["random"] = lambda upper: upper - 1
+
+            template = env.get_template("mobileconfig.j2")
+            output = template.render(**test_vars)
+
+            # Validate output
+            assert "<?xml" in output, "Missing XML declaration"
+            assert "<plist" in output, "Missing plist element"
+            assert "PayloadType" in output, "Missing PayloadType"
+
+            # Check on-demand configuration
+            if test_case.get("algo_ondemand_cellular") or test_case.get("algo_ondemand_wifi"):
+                assert "OnDemandEnabled" in output, f"Missing OnDemand config for {test_case['name']}"
+
+            print(f"  ✅ Mobileconfig: {test_case['name']}")
+
+        except Exception as e:
+            errors.append(f"Mobileconfig ({test_case['name']}): {e!s}")
+            print(f"  ❌ Mobileconfig ({test_case['name']}): {e!s}")
+
+    assert not errors, "\n".join(errors)
+
+    print("✅ All mobileconfig tests passed")
+
+
+if __name__ == "__main__":
+    print("🔍 Testing StrongSwan templates...\n")
+
+    # Run tests
+    tests = [
+        test_strongswan_templates,
+        test_openssl_template_constraints,
+        test_mobileconfig_template,
+    ]
+
+    for test in tests:
+        test()
+
+    print("\n✅ All StrongSwan template tests passed!")

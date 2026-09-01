@@ -23,24 +23,28 @@
   file:
     path: /var/jail/
     state: directory
-    mode: 0755
+    mode: '0755'
     owner: root
-    group: "{{ root_group|default('root') }}"
+    group: "{{ root_group | default('root') }}"
 
-- block:
+- tags: update-users
+  block:
     - name: Ensure that the SSH users exist
       user:
         name: "{{ item }}"
         group: algo
+        groups: algo
         home: /var/jail/{{ item }}
         createhome: true
         generate_ssh_key: false
         shell: /bin/false
         state: present
         append: true
-      with_items: "{{ users }}"
+      loop: "{{ users }}"
 
-    - block:
+    - become: false
+      delegate_to: localhost
+      block:
         - name: Clean up the ssh-tunnel directory
           file:
             dest: "{{ ssh_tunnels_config_path }}"
@@ -58,7 +62,7 @@
           stat:
             path: "{{ ssh_tunnels_config_path }}/{{ item }}.pem"
           register: privatekey
-          with_items: "{{ users }}"
+          loop: "{{ users }}"
 
         - name: Build ssh private keys
           openssl_privatekey:
@@ -66,9 +70,9 @@
             passphrase: "{{ p12_export_password }}"
             cipher: auto
             force: false
-          no_log: "{{ no_log|bool }}"
+          no_log: "{{ algo_no_log | bool }}"
           when: not item.stat.exists
-          with_items: "{{ privatekey.results }}"
+          loop: "{{ privatekey.results }}"
           register: openssl_privatekey
 
         - name: Build ssh public keys
@@ -78,18 +82,16 @@
             privatekey_passphrase: "{{ p12_export_password }}"
             format: OpenSSH
             force: true
-          no_log: "{{ no_log|bool }}"
+          no_log: "{{ algo_no_log | bool }}"
           when: item.changed
-          with_items: "{{ openssl_privatekey.results }}"
+          loop: "{{ openssl_privatekey.results }}"
 
         - name: Build the client ssh config
           template:
             src: ssh_config.j2
             dest: "{{ ssh_tunnels_config_path }}/{{ item }}.ssh_config"
-            mode: 0700
-          with_items: "{{ users }}"
-      delegate_to: localhost
-      become: false
+            mode: '0700'
+          loop: "{{ users }}"
 
     - name: The authorized keys file created
       authorized_key:
@@ -98,7 +100,7 @@
         state: present
         manage_dir: true
         exclusive: true
-      with_items: "{{ users }}"
+      loop: "{{ users }}"
 
     - name: Get active users
       getent:
@@ -113,5 +115,4 @@
         remove: true
         force: true
       when: item not in users
-      with_items: "{{ getent_group['algo'][2].split(',') }}"
-  tags: update-users
+      loop: "{{ getent_group['algo'][2].split(',') }}"

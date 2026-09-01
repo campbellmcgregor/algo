@@ -6,7 +6,7 @@
   digital_ocean_sshkey:
     oauth_token: "{{ algo_do_token }}"
     name: "{{ SSH_keys.comment }}"
-    ssh_pub_key: "{{ lookup('file', '{{ SSH_keys.public }}') }}"
+    ssh_pub_key: "{{ lookup('file', SSH_keys.public) }}"
   register: do_ssh_key
 
 - name: Creating a droplet...
@@ -16,12 +16,12 @@
     oauth_token: "{{ algo_do_token }}"
     size: "{{ cloud_providers.digitalocean.size }}"
     region: "{{ algo_do_region }}"
-    image: "{{ cloud_providers.digitalocean.image }}"
+    image: "{{ cloud_providers.digitalocean.image[ubuntu_version] }}"
     wait_timeout: 300
     unique_name: true
     ipv6: true
     ssh_keys: "{{ do_ssh_key.data.ssh_key.id }}"
-    user_data: "{{ lookup('template', 'files/cloud-init/base.yml') }}"
+    user_data: "{{ lookup('template', 'files/cloud-init/base.yml') | string }}"
     tags:
       - Environment:Algo
   register: digital_ocean_droplet
@@ -30,9 +30,10 @@
 - set_fact:
     droplet: "{{ digital_ocean_droplet.data.droplet | default(digital_ocean_droplet.data) }}"
 
-- block:
+- when: alternative_ingress_ip | bool
+  block:
     - name: Create a Floating IP
-      digital_ocean_floating_ip:
+      community.digitalocean.digital_ocean_floating_ip:
         state: present
         oauth_token: "{{ algo_do_token }}"
         droplet_id: "{{ droplet.id }}"
@@ -41,7 +42,6 @@
     - name: Set the static ip as a fact
       set_fact:
         cloud_alternative_ingress_ip: "{{ digital_ocean_floating_ip.data.floating_ip.ip }}"
-  when: alternative_ingress_ip
 
 - set_fact:
     cloud_instance_ip: "{{ (droplet.networks.v4 | selectattr('type', '==', 'public')).0.ip_address }}"

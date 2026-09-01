@@ -2,22 +2,302 @@
 
 set -e
 
-if [ -z ${VIRTUAL_ENV+x} ]
-then
-  ACTIVATE_SCRIPT="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )/.env/bin/activate"
-  if [ -f "$ACTIVATE_SCRIPT" ]
-  then
-    # shellcheck source=/dev/null
-    source "$ACTIVATE_SCRIPT"
-  else
-    echo "$ACTIVATE_SCRIPT not found.  Did you follow documentation to install dependencies?"
+ALGO_SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$ALGO_SOURCE" ]; do
+    ALGO_SOURCE_DIR="$(cd -P -- "$(dirname -- "$ALGO_SOURCE")" && pwd)"
+    ALGO_SOURCE="$(readlink "$ALGO_SOURCE")"
+    [[ "$ALGO_SOURCE" != /* ]] && ALGO_SOURCE="$ALGO_SOURCE_DIR/$ALGO_SOURCE"
+done
+ALGO_DIR="$(cd -P -- "$(dirname -- "$ALGO_SOURCE")" && pwd)"
+unset ALGO_SOURCE ALGO_SOURCE_DIR
+cd "$ALGO_DIR"
+export ANSIBLE_CONFIG="$ALGO_DIR/ansible.cfg"
+export ANSIBLE_COLLECTIONS_PATH="$ALGO_DIR/.ansible/collections"
+
+UV_VERSION="0.12.3"
+UV_INSTALLER_SHA256="a7e3924ea1cd06bf1518c577d635c624ae2e2db030e0fc8ff8cf426224384e17"
+UV_INSTALLER_PS1_SHA256="7b84813e3fad9586da122e362d4dcba1e2e611664244d004bcfc32b2fdf10430"
+
+# Track which installation method succeeded
+UV_INSTALL_METHOD=""
+
+verify_sha256() {
+    file="$1"
+    expected="$2"
+    if command -v sha256sum &> /dev/null; then
+        if ! actual="$(sha256sum "$file")"; then
+            echo "Error: sha256sum failed while verifying the uv installer."
+            return 1
+        fi
+    elif command -v shasum &> /dev/null; then
+        if ! actual="$(shasum -a 256 "$file")"; then
+            echo "Error: shasum failed while verifying the uv installer."
+            return 1
+        fi
+    else
+        echo "Error: sha256sum or shasum is required to verify the uv installer."
+        return 1
+    fi
+    actual="${actual%% *}"
+    if [[ "$actual" != "$expected" ]]; then
+        echo "Error: uv installer checksum mismatch."
+        return 1
+    fi
+}
+
+cleanup_uv_installer() {
+    if [[ -n "${installer_path:-}" ]]; then
+        rm -f "$installer_path"
+    fi
+}
+
+handle_uv_installer_signal() {
+    cleanup_uv_installer
+    trap - EXIT HUP INT TERM
     exit 1
-  fi
+}
+
+# Function to install uv via package managers (most secure)
+install_uv_via_package_manager() {
+    echo "Attempting to install uv via system package manager..."
+
+    if command -v brew &> /dev/null; then
+        echo "Using Homebrew..."
+        brew install uv && UV_INSTALL_METHOD="Homebrew" && return 0
+    elif command -v apt &> /dev/null && apt list uv 2>/dev/null | grep -q uv; then
+        echo "Using apt..."
+        sudo apt update && sudo apt install -y uv && UV_INSTALL_METHOD="apt" && return 0
+    elif command -v dnf &> /dev/null; then
+        echo "Using dnf..."
+        sudo dnf install -y uv 2>/dev/null && UV_INSTALL_METHOD="dnf" && return 0
+    elif command -v pacman &> /dev/null; then
+        echo "Using pacman..."
+        sudo pacman -S --noconfirm uv 2>/dev/null && UV_INSTALL_METHOD="pacman" && return 0
+    elif command -v zypper &> /dev/null; then
+        echo "Using zypper..."
+        sudo zypper install -y uv 2>/dev/null && UV_INSTALL_METHOD="zypper" && return 0
+    elif command -v winget &> /dev/null; then
+        echo "Using winget..."
+        winget install --id=astral-sh.uv -e && UV_INSTALL_METHOD="winget" && return 0
+    elif command -v scoop &> /dev/null; then
+        echo "Using scoop..."
+        scoop install uv && UV_INSTALL_METHOD="scoop" && return 0
+    fi
+
+    return 1
+}
+
+# Function to handle Ubuntu-specific installation alternatives
+install_uv_ubuntu_alternatives() {
+    # Check if we're on Ubuntu
+    if ! command -v lsb_release &> /dev/null || [[ "$(lsb_release -si)" != "Ubuntu" ]]; then
+        return 1  # Not Ubuntu, skip these options
+    fi
+
+    echo ""
+    echo "Ubuntu detected. Additional trusted installation options available:"
+    echo ""
+    echo "1. pipx (official PyPI, installs ~9 packages)"
+    echo "   Command: sudo apt install pipx && pipx install uv"
+    echo ""
+    echo "2. snap (community-maintained by Canonical employee)"
+    echo "   Command: sudo snap install astral-uv --classic"
+    echo "   Source: https://github.com/lengau/uv-snap"
+    echo ""
+    echo "3. Continue to official installer script download"
+    echo ""
+
+    while true; do
+        read -r -p "Choose installation method (1/2/3): " choice
+        case $choice in
+            1)
+                echo "Installing uv via pipx..."
+                if sudo apt update && sudo apt install -y pipx; then
+                    if pipx install uv; then
+                        # Add pipx bin directory to PATH
+                        export PATH="$HOME/.local/bin:$PATH"
+                        UV_INSTALL_METHOD="pipx"
+                        return 0
+                    fi
+                fi
+                echo "pipx installation failed, trying next option..."
+                ;;
+            2)
+                echo "Installing uv via snap..."
+                if sudo snap install astral-uv --classic; then
+                    # Snap binaries should be automatically in PATH via /snap/bin
+                    UV_INSTALL_METHOD="snap"
+                    return 0
+                fi
+                echo "snap installation failed, trying next option..."
+                ;;
+            3)
+                return 1  # Continue to official installer download
+                ;;
+            *)
+                echo "Invalid option. Please choose 1, 2, or 3."
+                ;;
+        esac
+    done
+}
+
+# Function to install uv via download (with user consent)
+install_uv_via_download() {
+    echo ""
+    echo "⚠️  SECURITY NOTICE ⚠️"
+    echo "uv is not available via system package managers on this system."
+    echo "To continue, we need to download and verify the uv ${UV_VERSION} installer from GitHub Releases."
+    echo ""
+    echo "For maximum security, you can install uv manually instead:"
+    echo "  1. Visit: https://docs.astral.sh/uv/getting-started/installation/"
+    echo "  2. Download the binary for your platform from GitHub releases"
+    echo "  3. Verify checksums and install manually"
+    echo "  4. Then run: ./algo"
+    echo ""
+
+    read -p "Continue with script download? (y/N): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo "Installation cancelled. Please install uv manually and retry."
+        exit 1
+    fi
+
+    echo "Downloading uv installation script..."
+    if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" || "$OSTYPE" == "linux-gnu" && -n "${WSL_DISTRO_NAME:-}" ]] || uname -s | grep -q "MINGW\|MSYS"; then
+        # Windows (Git Bash/WSL/MINGW) - download, verify, then execute.
+        powershell_command=""
+        for candidate in powershell.exe pwsh.exe powershell pwsh; do
+            if command -v "$candidate" &> /dev/null; then
+                powershell_command="$candidate"
+                break
+            fi
+        done
+        if [[ -z "$powershell_command" ]]; then
+            echo "Error: PowerShell was not found. Install uv manually and retry."
+            return 1
+        fi
+        if ! "$powershell_command" -NoProfile -ExecutionPolicy ByPass -Command "
+            \$path = [IO.Path]::GetTempFileName()
+            try {
+                Invoke-WebRequest -Uri 'https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-installer.ps1' -OutFile \$path
+                \$actual = (Get-FileHash -Algorithm SHA256 \$path).Hash.ToLowerInvariant()
+                if (\$actual -ne '${UV_INSTALLER_PS1_SHA256}') { throw 'uv installer checksum mismatch' }
+                & ([ScriptBlock]::Create([IO.File]::ReadAllText(\$path)))
+            } finally {
+                Remove-Item -LiteralPath \$path -Force -ErrorAction SilentlyContinue
+            }
+        "; then
+            return 1
+        fi
+        UV_INSTALL_METHOD="official installer (Windows)"
+    else
+        # macOS/Linux - download, verify, then execute.
+        installer_path="$(mktemp)"
+        trap cleanup_uv_installer EXIT
+        trap handle_uv_installer_signal HUP INT TERM
+        if ! curl --proto '=https' --tlsv1.2 --fail --location --show-error \
+            "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-installer.sh" \
+            --output "$installer_path"; then
+            rm -f "$installer_path"
+            return 1
+        fi
+        if ! verify_sha256 "$installer_path" "$UV_INSTALLER_SHA256"; then
+            rm -f "$installer_path"
+            return 1
+        fi
+        if ! sh "$installer_path"; then
+            rm -f "$installer_path"
+            return 1
+        fi
+        rm -f "$installer_path"
+        installer_path=""
+        trap - EXIT HUP INT TERM
+        UV_INSTALL_METHOD="official installer"
+    fi
+}
+
+# Check if uv is installed, if not, install it securely
+if ! command -v uv &> /dev/null; then
+    echo "uv (Python package manager) not found. Installing..."
+
+    # Try package managers first (most secure)
+    if ! install_uv_via_package_manager; then
+        # Try Ubuntu-specific alternatives if available
+        if ! install_uv_ubuntu_alternatives; then
+            # Fall back to download with user consent
+            install_uv_via_download
+        fi
+    fi
+
+    # Reload PATH to find uv (includes pipx, cargo, and snap paths)
+    # Note: This PATH change only affects the current shell session.
+    # Users may need to restart their terminal for subsequent runs.
+    export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/snap/bin:$PATH"
+
+    # Verify installation worked
+    if ! command -v uv &> /dev/null; then
+        echo "Error: uv installation failed. Please restart your terminal and try again."
+        echo "Or install manually from: https://docs.astral.sh/uv/getting-started/installation/"
+        exit 1
+    fi
+
+    echo "✓ uv installed successfully via ${UV_INSTALL_METHOD}!"
 fi
 
-case "$1" in
-  update-users) PLAYBOOK=users.yml; ARGS=( "${@:2}"  -t update-users ) ;;
-  *) PLAYBOOK=main.yml; ARGS=( "${@}" ) ;;
-esac
+# Install Ansible Galaxy collections if requirements.yml exists
+# This is needed for cloud providers that use collection modules (Linode, DigitalOcean, Azure, etc.)
+if [ -f "requirements.yml" ]; then
+    uv run ansible-galaxy collection install --force -p .ansible/collections -r requirements.yml
+fi
 
-ansible-playbook ${PLAYBOOK} "${ARGS[@]}"
+# Run the appropriate playbook
+case "$1" in
+  help|-h|--help)
+    echo "Usage: ./algo [COMMAND] [ANSIBLE_OPTIONS]"
+    echo ""
+    echo "Set up a personal VPN in the cloud."
+    echo ""
+    echo "Commands:"
+    echo "  (default)        Deploy a new VPN server"
+    echo "  update-users     Add or remove users on an existing server"
+    echo "  destroy          Destroy a deployed server and clean up configs"
+    echo "  list-servers     List deployed servers (JSON output)"
+    echo ""
+    echo "Configuration:"
+    echo "  Edit config.cfg to set users, DNS, and VPN options before deploying."
+    echo ""
+    echo "Non-interactive deployment:"
+    echo "  ./algo -e 'provider=digitalocean server_name=algo region=nyc3 do_token=TOKEN'"
+    echo ""
+    echo "Common Ansible options (passed through):"
+    echo "  -e KEY=VALUE     Set variable (bypass interactive prompts)"
+    echo "  -v, -vvv         Increase output verbosity"
+    echo "  --skip-tags TAG  Skip specific components"
+    echo "  -t, --tags TAG   Run only specific components"
+    echo ""
+    echo "Docs: https://trailofbits.github.io/algo/"
+    exit 0
+    ;;
+  update-users)
+    uv run ansible-playbook users.yml "${@:2}" -t update-users ;;
+  destroy)
+    if [ -z "${2:-}" ] || [[ "$2" == -* ]]; then
+      echo "Usage: ./algo destroy <server-ip> [ANSIBLE_OPTIONS]"
+      echo ""
+      echo "Destroy a deployed Algo VPN server and remove local configs."
+      echo ""
+      echo "Arguments:"
+      echo "  server-ip        IP address of the server to destroy"
+      echo ""
+      echo "Examples:"
+      echo "  ./algo destroy 188.166.66.185"
+      echo "  ./algo destroy 52.1.2.3 -e \"region=us-east-1\""
+      echo "  ./algo destroy 188.166.66.185 -e \"confirm_destroy=true\""
+      exit 1
+    fi
+    uv run ansible-playbook destroy.yml -e "server_ip=$2" "${@:3}" ;;
+  list-servers)
+    uv run python3 scripts/list_servers.py "${@:2}" ;;
+  *)
+    uv run ansible-playbook main.yml "${@}" ;;
+esac

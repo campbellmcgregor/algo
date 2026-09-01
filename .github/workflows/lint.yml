@@ -1,0 +1,237 @@
+---
+name: Lint
+
+'on':
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ACTIONLINT_VERSION: '1.7.12'
+  ACTIONLINT_SHA256: '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8'
+  POWERSHELL_VERSION: '7.4.0'
+  POWERSHELL_DEB_SHA256: '550331e243a7311e1bf0ca83d8c96c5e78ba82a765c4a9ba34aa0db6eb9a9f22'
+  PSSCRIPTANALYZER_VERSION: '1.25.0'
+  PSSCRIPTANALYZER_SHA256: '14e634c828eb98efb9f40b2918ba90f139ed5eccdf663a2a747736d996995d60'
+
+jobs:
+  ansible-lint:
+    name: Ansible linting
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Setup Algo environment
+        uses: ./.github/actions/setup-algo
+        with:
+          install-ansible-collections: 'true'
+
+      - name: Run ansible-lint
+        run: |
+          uv run --with ansible-lint ansible-lint .
+
+      - name: Run playbook dry-run check (catch runtime issues)
+        run: |
+          # Test main playbook logic without making changes
+          # This catches filter warnings, collection issues, and runtime errors
+          uv run ansible-playbook main.yml --check --connection=local \
+            -e "server_ip=test" \
+            -e "server_name=ci-test" \
+            -e "IP_subject_alt_name=192.168.1.1"
+
+  yaml-lint:
+    name: YAML linting
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Setup uv environment
+        uses: ./.github/actions/setup-uv
+
+      - name: Run yamllint
+        run: uv run --with yamllint yamllint -c .yamllint .
+
+  jinja2-lint:
+    name: Jinja2 template linting
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Setup uv environment
+        uses: ./.github/actions/setup-uv
+
+      - name: Run j2lint
+        run: |
+          # Lint Jinja2 templates for syntax and style issues
+          # Ignored rules (incompatible with Ansible config-file templates):
+          #   S3: indentation (dictated by output format, not Jinja style)
+          #   S5: tabs (some config formats require them)
+          #   S6: whitespace-control delimiters ({%- -%} are standard Ansible)
+          #   S7: single-statement-per-line (inline Jinja in config output)
+          #   V1: lowercase variables (existing names like IP_subject_alt_name)
+          uv run --with j2lint j2lint roles/ --ignore S3 S5 S6 S7 V1
+
+  python-lint:
+    name: Python linting
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Setup Algo environment
+        uses: ./.github/actions/setup-algo
+
+      - name: Run ruff check
+        run: |
+          # Fast Python linter
+          uv run --with ruff ruff check .
+
+      - name: Run ruff format check
+        run: |
+          # Verify consistent Python formatting
+          uv run --with ruff ruff format --check .
+
+      - name: Check internal documentation links
+        run: scripts/check-internal-links.py
+
+  python-types:
+    name: Python type checking
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Setup Algo environment
+        uses: ./.github/actions/setup-algo
+
+      - name: Run ty check
+        run: |
+          # Type checking with ty
+          uv run --with ty ty check
+
+  shellcheck:
+    name: Shell script linting
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Setup Algo environment
+        uses: ./.github/actions/setup-algo
+        with:
+          install-shellcheck: 'true'
+
+      - name: Run shellcheck
+        run: |
+          # Check repository scripts as one fail-closed batch; exclude generated dependencies.
+          find . -type f -name "*.sh" \
+            -not -path "./.git/*" \
+            -not -path "./.venv/*" \
+            -not -path "./.ansible/*" \
+            -print0 | xargs -0 --no-run-if-empty shellcheck
+
+  powershell-lint:
+    name: PowerShell script linting
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install PowerShell
+        run: |
+          archive="powershell_${POWERSHELL_VERSION}-1.deb_amd64.deb"
+          curl --fail --location --show-error \
+            "https://github.com/PowerShell/PowerShell/releases/download/v${POWERSHELL_VERSION}/${archive}" \
+            --output "${archive}"
+          printf '%s  %s\n' "${POWERSHELL_DEB_SHA256}" "${archive}" | sha256sum --check
+          sudo dpkg -i "${archive}"
+          sudo apt-get install -f -y
+
+      - name: Install PSScriptAnalyzer
+        run: |
+          archive="PSScriptAnalyzer.${PSSCRIPTANALYZER_VERSION}.nupkg"
+          module_dir="${HOME}/.local/share/powershell/Modules/PSScriptAnalyzer/${PSSCRIPTANALYZER_VERSION}"
+          curl --fail --location --show-error \
+            "https://github.com/PowerShell/PSScriptAnalyzer/releases/download/${PSSCRIPTANALYZER_VERSION}/${archive}" \
+            --output "${archive}"
+          printf '%s  %s\n' "${PSSCRIPTANALYZER_SHA256}" "${archive}" | sha256sum --check
+          mkdir -p "${module_dir}"
+          PSSCRIPTANALYZER_ARCHIVE="${archive}" PSSCRIPTANALYZER_MODULE_DIR="${module_dir}" python3 -c \
+            'import os, zipfile; zipfile.ZipFile(os.environ["PSSCRIPTANALYZER_ARCHIVE"]).extractall(os.environ["PSSCRIPTANALYZER_MODULE_DIR"])'
+
+      - name: Run PowerShell syntax check
+        run: |
+          # Check syntax by parsing the script
+          pwsh -NoProfile -NonInteractive -Command "
+            try {
+              \$null = [System.Management.Automation.PSParser]::Tokenize((Get-Content -Path './algo.ps1' -Raw), [ref]\$null)
+              Write-Host '✓ PowerShell syntax check passed'
+            } catch {
+              Write-Error 'PowerShell syntax error: ' + \$_.Exception.Message
+              exit 1
+            }
+          "
+
+      - name: Run PSScriptAnalyzer
+        run: |
+          pwsh -Command "
+            \$results = Invoke-ScriptAnalyzer -Path './algo.ps1' -Severity Warning,Error
+            if (\$results.Count -gt 0) {
+              \$results | Format-Table -AutoSize
+              exit 1
+            } else {
+              Write-Host '✓ PSScriptAnalyzer check passed'
+            }
+          "
+
+  actionlint:
+    name: GitHub Actions linting
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install actionlint
+        run: |
+          archive="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl --fail --location --show-error \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${archive}" \
+            --output "${archive}"
+          printf '%s  %s\n' "${ACTIONLINT_SHA256}" "${archive}" | sha256sum --check
+          tar --extract --gzip --file "${archive}" actionlint
+          sudo install -m 0755 actionlint /usr/local/bin/actionlint
+
+      - name: Run actionlint
+        run: |
+          actionlint .github/workflows/*.yml .github/workflows/*.yaml
+
+  zizmor:
+    name: GitHub Actions security audit
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install zizmor
+        run: |
+          pip install zizmor
+
+      - name: Run zizmor
+        run: |
+          zizmor .github/workflows/

@@ -1,7 +1,4 @@
 ---
-- name: Build python virtual environment
-  import_tasks: venv.yml
-
 - name: Include prompts
   import_tasks: prompts.yml
 
@@ -13,16 +10,17 @@
       touch /var/lib/cloud/data/result.json
 
 - name: Create a stackscript
-  linode_stackscript_v4:
-    access_token: "{{ algo_linode_token }}"
+  linode.cloud.stackscript:
+    api_token: "{{ algo_linode_token }}"
     label: "{{ algo_server_name }}"
     state: present
     description: Environment:Algo
     images:
-      - "{{ cloud_providers.linode.image }}"
+      - "{{ cloud_providers.linode.image[ubuntu_version] }}"
     script: |
       {{ stackscript }}
   register: _linode_stackscript
+  no_log: true
 
 - name: Update the stackscript
   uri:
@@ -36,18 +34,20 @@
       Content-Type: application/json
       Authorization: Bearer {{ algo_linode_token }}
   when: (_linode_stackscript.stackscript.script | hash('md5')) != (stackscript | hash('md5'))
+  no_log: true
 
 - name: Creating an instance...
-  linode_v4:
-    access_token: "{{ algo_linode_token }}"
+  linode.cloud.instance:
+    api_token: "{{ algo_linode_token }}"
     label: "{{ algo_server_name }}"
     state: present
     region: "{{ algo_linode_region }}"
-    image: "{{ cloud_providers.linode.image }}"
+    image: "{{ cloud_providers.linode.image[ubuntu_version] }}"
     type: "{{ cloud_providers.linode.type }}"
     authorized_keys: "{{ public_key }}"
     stackscript_id: "{{ _linode_stackscript.stackscript.id }}"
   register: _linode
+  no_log: true
 
 - set_fact:
     cloud_instance_ip: "{{ _linode.instance.ipv4[0] }}"

@@ -1,17 +1,17 @@
 ---
 - set_fact:
-    secret: "{{ azure_secret | default(lookup('env','AZURE_SECRET'), true) }}"
-    tenant: "{{ azure_tenant | default(lookup('env','AZURE_TENANT'), true) }}"
-    client_id: "{{ azure_client_id | default(lookup('env','AZURE_CLIENT_ID'), true) }}"
-    subscription_id: "{{ azure_subscription_id | default(lookup('env','AZURE_SUBSCRIPTION_ID'), true) }}"
+    secret: "{{ azure_secret | default(lookup('env', 'AZURE_SECRET'), true) }}"
+    tenant: "{{ azure_tenant | default(lookup('env', 'AZURE_TENANT'), true) }}"
+    client_id: "{{ azure_client_id | default(lookup('env', 'AZURE_CLIENT_ID'), true) }}"
+    subscription_id: "{{ azure_subscription_id | default(lookup('env', 'AZURE_SUBSCRIPTION_ID'), true) }}"
+  no_log: true
 
-- block:
+- when: region is undefined
+  block:
     - name: Set the default region
       set_fact:
         default_region: >-
-          {% for r in azure_regions %}
-          {%- if r['name'] == "eastus" %}{{ loop.index }}{% endif %}
-          {%- endfor %}
+          {% for r in azure_regions %}{%- if r['name'] == "eastus" %}{{ loop.index }}{% endif %}{%- endfor %}
 
     - pause:
         prompt: |
@@ -23,4 +23,3 @@
           Enter the number of your desired region
           [{{ default_region }}]
       register: _algo_region
-  when: region is undefined

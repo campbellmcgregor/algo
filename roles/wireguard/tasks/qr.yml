@@ -1,0 +1,238 @@
+---
+- name: Check for the Segno QR generator
+  stat:
+    path: "{{ ansible_playbook_python | dirname }}/segno"
+  register: wireguard_segno
+
+- name: Require the Segno QR generator
+  assert:
+    that:
+      - wireguard_segno.stat.exists
+      - wireguard_segno.stat.isreg
+      - wireguard_segno.stat.executable
+    fail_msg: >-
+      Segno is not installed as an executable next to ansible_playbook_python
+      ({{ ansible_playbook_python }}). Install Algo's Python dependencies in
+      that environment (for example: uv sync), then run the playbook again.
+
+- name: Validate WireGuard QR usernames
+  assert:
+    that:
+      - item is string
+      - item is regex('^[A-Za-z0-9][A-Za-z0-9_.@ -]*\Z')
+    fail_msg: WireGuard usernames used for QR output must be safe filename components
+  loop: "{{ wireguard_users }}"
+  when: item in users
+  no_log: true
+
+- name: Acquire QR generation lock atomically
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - -c
+      - |
+        import fcntl
+        import os
+        import secrets
+        import stat
+        import sys
+        import time
+        primary, guard, ttl = sys.argv[1], sys.argv[2], int(sys.argv[3])
+        owner_path = os.path.join(primary, "owner")
+        token = secrets.token_hex(32)
+
+        def create_lock():
+            os.mkdir(primary, 0o700)
+            try:
+                owner_fd = os.open(owner_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+                with os.fdopen(owner_fd, "w") as owner:
+                    owner.write(token)
+                    owner.flush()
+                    os.fsync(owner.fileno())
+            except BaseException:
+                try:
+                    os.unlink(owner_path)
+                except FileNotFoundError:
+                    pass
+                os.rmdir(primary)
+                raise
+
+        def remove_stale_lock():
+            entries = os.listdir(primary)
+            if entries == ["owner"]:
+                owner_stat = os.stat(owner_path, follow_symlinks=False)
+                if not stat.S_ISREG(owner_stat.st_mode):
+                    raise RuntimeError("stale QR lock owner is not a regular file")
+                os.unlink(owner_path)
+            elif entries:
+                raise RuntimeError("stale QR lock contains unexpected entries")
+            os.rmdir(primary)
+
+        guard_fd = os.open(guard, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(guard_fd, fcntl.LOCK_EX)
+            try:
+                create_lock()
+            except FileExistsError:
+                primary_stat = os.stat(primary, follow_symlinks=False)
+                if not stat.S_ISDIR(primary_stat.st_mode):
+                    raise RuntimeError("QR lock path is not a directory")
+                age = time.time() - primary_stat.st_mtime
+                if age <= ttl:
+                    raise
+                remove_stale_lock()
+                create_lock()
+            lock_inode = os.stat(primary, follow_symlinks=False).st_ino
+            print(f"{token}:{lock_inode}")
+        finally:
+            os.close(guard_fd)
+      - "{{ wireguard_config_path }}/.algo-qr.lock"
+      - "{{ wireguard_config_path }}/.algo-qr-recovery.lock"
+      - "900"
+  changed_when: true
+  register: wireguard_qr_lock
+  no_log: true
+
+- name: Generate QR codes under lock
+  block:
+    - name: Inspect existing QR codes
+      stat:
+        path: "{{ wireguard_config_path }}/{{ item }}.png"
+        follow: false
+      loop: "{{ wireguard_users }}"
+      register: wireguard_qr_files
+      when: item in users
+
+    - name: Validate existing QR code files
+      assert:
+        that:
+          - not item.stat.exists or (item.stat.isreg and not item.stat.islnk)
+        fail_msg: Existing QR output must be a regular non-symlink file
+      loop: "{{ wireguard_qr_files.results }}"
+      when: not item.skipped | default(false)
+      no_log: true
+
+    - name: Allocate secure QR output files
+      ansible.builtin.tempfile:
+        state: file
+        path: "{{ wireguard_config_path }}"
+        prefix: .algo-qr-
+        suffix: .png
+      loop: "{{ wireguard_users }}"
+      loop_control:
+        index_var: index
+      register: wireguard_qr_temp_files
+      when:
+        - item in users
+        - not wireguard_qr_files.results[index].stat.exists
+      no_log: true
+
+    - name: Generate and install QR codes safely
+      block:
+        - name: Generate QR codes
+          command:
+            argv:
+              - "{{ ansible_playbook_python }}"
+              - -c
+              - >-
+                import sys; import segno;
+                segno.make(sys.stdin.read(), micro=False).save(sys.argv[1], scale=5)
+              - "{{ wireguard_qr_job.path }}"
+            stdin: "{{ lookup('template', 'client.conf.j2') }}"
+            stdin_add_newline: false
+          changed_when: true
+          loop: "{{ wireguard_qr_temp_files.results }}"
+          loop_control:
+            loop_var: wireguard_qr_job
+            index_var: index
+          vars:
+            item: "{{ wireguard_qr_job.item }}"
+          when: not wireguard_qr_job.skipped | default(false)
+          no_log: true
+
+        - name: Install generated QR codes atomically
+          ansible.builtin.command:
+            argv:
+              - "{{ ansible_playbook_python }}"
+              - -c
+              - |
+                import os
+                import sys
+                source, destination = sys.argv[1], sys.argv[2]
+                os.link(source, destination, follow_symlinks=False)
+                directory_fd = os.open(os.path.dirname(destination), os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+              - "{{ wireguard_qr_job.path }}"
+              - "{{ wireguard_config_path }}/{{ wireguard_qr_job.item }}.png"
+          changed_when: true
+          loop: "{{ wireguard_qr_temp_files.results }}"
+          loop_control:
+            loop_var: wireguard_qr_job
+          when: not wireguard_qr_job.skipped | default(false)
+          no_log: true
+      always:
+        - name: Remove temporary QR files
+          file:
+            path: "{{ wireguard_qr_job.path }}"
+            state: absent
+          loop: "{{ wireguard_qr_temp_files.results }}"
+          loop_control:
+            loop_var: wireguard_qr_job
+          when: not wireguard_qr_job.skipped | default(false)
+          no_log: true
+
+    - name: Restrict QR code permissions
+      file:
+        path: "{{ wireguard_config_path }}/{{ item }}.png"
+        mode: "0600"
+      loop: "{{ wireguard_users }}"
+      when: item in users
+  always:
+    - name: Release QR generation lock safely
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - -c
+          - |
+            import fcntl
+            import os
+            import stat
+            import sys
+            primary, guard, identity = sys.argv[1], sys.argv[2], sys.argv[3]
+            token, inode_text = identity.rsplit(":", 1)
+            expected_inode = int(inode_text)
+            owner_path = os.path.join(primary, "owner")
+            guard_fd = os.open(guard, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(guard_fd, fcntl.LOCK_EX)
+                try:
+                    primary_stat = os.stat(primary, follow_symlinks=False)
+                except FileNotFoundError:
+                    print("not-owner")
+                    sys.exit(0)
+                if not stat.S_ISDIR(primary_stat.st_mode) or primary_stat.st_ino != expected_inode:
+                    print("not-owner")
+                    sys.exit(0)
+                owner_fd = os.open(owner_path, os.O_RDONLY | os.O_NOFOLLOW)
+                try:
+                    owner_stat = os.fstat(owner_fd)
+                    owner = os.read(owner_fd, 129).decode("ascii")
+                finally:
+                    os.close(owner_fd)
+                if not stat.S_ISREG(owner_stat.st_mode) or owner != token:
+                    print("not-owner")
+                    sys.exit(0)
+                os.unlink(owner_path)
+                os.rmdir(primary)
+                print("released")
+            finally:
+                os.close(guard_fd)
+          - "{{ wireguard_config_path }}/.algo-qr.lock"
+          - "{{ wireguard_config_path }}/.algo-qr-recovery.lock"
+          - "{{ wireguard_qr_lock.stdout }}"
+      register: wireguard_qr_release
+      changed_when: wireguard_qr_release.stdout == 'released'
+      no_log: true

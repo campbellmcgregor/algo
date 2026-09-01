@@ -1,0 +1,306 @@
+---
+name: Integration Tests
+
+'on':
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'main.yml'
+      - 'roles/**'
+      - 'playbooks/**'
+      - 'library/**'
+      - 'tests/e2e/**'
+      - 'tests/integration/**'
+      - 'config.cfg'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - 'requirements.yml'
+      - 'roles/cloud-*/**'
+      - '.github/workflows/**'
+      - '.github/workflows/integration-tests.yml'
+      - '.github/actions/**'
+  workflow_dispatch:
+  schedule:
+    - cron: '0 2 * * 1'  # Weekly on Monday at 2 AM
+
+permissions:
+  contents: read
+
+jobs:
+  localhost-deployment:
+    name: Localhost VPN Deployment Test (${{ matrix.os }}, ${{ matrix.vpn_type }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ['ubuntu-22.04', 'ubuntu-24.04']
+        vpn_type: ['wireguard', 'ipsec', 'both']
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with:
+          python-version: '3.12'
+          # Note: No pip cache - we use uv for dependency management
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            wireguard \
+            wireguard-tools \
+            strongswan \
+            strongswan-swanctl \
+            libstrongswan-standard-plugins \
+            libcharon-extra-plugins \
+            dnsmasq \
+            qrencode \
+            openssl \
+            "linux-headers-$(uname -r)" \
+            libxml2-utils \
+            dnsutils
+
+      - name: Setup uv environment
+        uses: ./.github/actions/setup-uv
+
+      - name: Install Ansible collections
+        run: uv run ansible-galaxy collection install -r requirements.yml
+
+      - name: Prepare ephemeral integration fixtures
+        run: |
+          rm -rf configs
+          mkdir -p "${RUNNER_TEMP}/algo-configs"
+          ln -s "${RUNNER_TEMP}/algo-configs" configs
+
+      - name: Create test configuration
+        run: |
+          CA_PASSWORD=$(openssl rand -hex 24)
+          P12_PASSWORD=$(openssl rand -hex 24)
+          umask 077
+          cat > integration-test.cfg << EOF
+          users:
+            - alice
+            - bob
+          cloud_providers:
+            local:
+              server: localhost
+              endpoint: 127.0.0.1
+          wireguard_enabled: ${{ matrix.vpn_type == 'wireguard' || matrix.vpn_type == 'both' }}
+          ipsec_enabled: ${{ matrix.vpn_type == 'ipsec' || matrix.vpn_type == 'both' }}
+          dns_adblocking: true
+          ssh_tunneling: false
+          store_pki: true
+          algo_provider: local
+          algo_server_name: github-ci-test
+          server: localhost
+          algo_ssh_port: 22
+          CA_password: "${CA_PASSWORD}"
+          p12_export_password: "${P12_PASSWORD}"
+          tests: true
+          algo_no_log: true
+          ansible_connection: local
+          dns_encryption: true
+          algo_dns_adblocking: true
+          algo_ssh_tunneling: false
+          BetweenClients_DROP: true
+          block_smb: true
+          block_netbios: true
+          pki_in_tmpfs: true
+          endpoint: 127.0.0.1
+          ssh_port: 4160
+          local_service_ip: 172.16.0.1
+          local_service_ipv6: "fd00::1"
+          EOF
+
+      - name: Run Algo deployment
+        run: |
+          # Run ansible-playbook via uv - become: true in playbook handles root
+          # GitHub runners have passwordless sudo for become escalation
+          uv run ansible-playbook main.yml \
+            -i "localhost," \
+            -c local \
+            -e @integration-test.cfg \
+            -e "provider=local"
+
+      - name: Verify services are running
+        run: |
+          # Check WireGuard
+          if [[ "${{ matrix.vpn_type }}" == "wireguard" || "${{ matrix.vpn_type }}" == "both" ]]; then
+            echo "Checking WireGuard..."
+            sudo wg show interfaces
+            if ! sudo systemctl is-active --quiet wg-quick@wg0; then
+              echo "✗ WireGuard service not running"
+              exit 1
+            fi
+            echo "✓ WireGuard is running"
+          fi
+
+          # Check the backend-specific StrongSwan service.
+          if [[ "${{ matrix.vpn_type }}" == "ipsec" || "${{ matrix.vpn_type }}" == "both" ]]; then
+            echo "Checking StrongSwan..."
+            STRONGSWAN_SERVICE="strongswan-starter"
+            if [[ "${{ matrix.os }}" == "ubuntu-24.04" ]]; then
+              STRONGSWAN_SERVICE="strongswan"
+            fi
+            if ! sudo systemctl is-active --quiet "${STRONGSWAN_SERVICE}"; then
+              echo "✗ StrongSwan service not running"
+              exit 1
+            fi
+            echo "✓ StrongSwan is running"
+          fi
+
+          # Check dnsmasq
+          if ! sudo systemctl is-active --quiet dnsmasq; then
+            echo "⚠️  dnsmasq not running (may be expected)"
+          else
+            echo "✓ dnsmasq is running"
+          fi
+
+          # Check dnscrypt-proxy
+          if sudo systemctl is-active --quiet dnscrypt-proxy; then
+            echo "✓ dnscrypt-proxy is running"
+          else
+            echo "⚠️  dnscrypt-proxy not running"
+          fi
+
+          # DNS health check - verify DNS resolution works
+          echo "Testing DNS resolution via local_service_ip (172.16.0.1)..."
+          if dig @172.16.0.1 google.com +short +timeout=5 | grep -q .; then
+            echo "✓ DNS resolution working"
+          else
+            echo "⚠️  DNS resolution failed (service may still be starting)"
+          fi
+
+      - name: Verify generated configs
+        run: |
+          echo "Checking generated configuration files..."
+
+          # WireGuard configs
+          if [[ "${{ matrix.vpn_type }}" == "wireguard" || "${{ matrix.vpn_type }}" == "both" ]]; then
+            for user in alice bob; do
+              if [ ! -f "configs/localhost/wireguard/${user}.conf" ]; then
+                echo "✗ Missing WireGuard config for ${user}"
+                exit 1
+              fi
+              if [ ! -f "configs/localhost/wireguard/${user}.png" ]; then
+                echo "✗ Missing WireGuard QR code for ${user}"
+                exit 1
+              fi
+            done
+            echo "✓ All WireGuard configs generated"
+          fi
+
+          # IPsec configs (p12 in manual/, mobileconfig in apple/)
+          if [[ "${{ matrix.vpn_type }}" == "ipsec" || "${{ matrix.vpn_type }}" == "both" ]]; then
+            for user in alice bob; do
+              if [ ! -f "configs/localhost/ipsec/manual/${user}.p12" ]; then
+                echo "✗ Missing IPsec certificate for ${user}"
+                exit 1
+              fi
+              if [ ! -f "configs/localhost/ipsec/apple/${user}.mobileconfig" ]; then
+                echo "✗ Missing IPsec mobile config for ${user}"
+                exit 1
+              fi
+            done
+            echo "✓ All IPsec configs generated"
+          fi
+
+      - name: Test VPN connectivity
+        run: |
+          echo "Testing basic VPN connectivity..."
+
+          # Test WireGuard
+          if [[ "${{ matrix.vpn_type }}" == "wireguard" || "${{ matrix.vpn_type }}" == "both" ]]; then
+            # Check if interface has peers
+            PEER_COUNT=$(sudo wg show wg0 peers | wc -l)
+            echo "✓ WireGuard has $PEER_COUNT peer(s) configured"
+          fi
+
+          # Test StrongSwan
+          if [[ "${{ matrix.vpn_type }}" == "ipsec" || "${{ matrix.vpn_type }}" == "both" ]]; then
+            # Check IPsec policies
+            sudo ipsec statusall | grep -E "INSTALLED|ESTABLISHED" || echo "No active IPsec connections (expected)"
+          fi
+
+      - name: Run WireGuard connectivity and IPsec validation tests
+        env:
+          VPN_TYPE: ${{ matrix.vpn_type }}
+        run: |
+          chmod +x tests/e2e/test-vpn-connectivity.sh
+          sudo tests/e2e/test-vpn-connectivity.sh "${VPN_TYPE}"
+
+      - name: Create sanitized diagnostics on failure
+        if: failure()
+        run: |
+          STRONGSWAN_SERVICE="strongswan-starter"
+          if [[ "${{ matrix.os }}" == "ubuntu-24.04" ]]; then
+            STRONGSWAN_SERVICE="strongswan"
+          fi
+          {
+            echo "vpn_type=${{ matrix.vpn_type }}"
+            echo "wireguard_service=$(sudo systemctl is-active wg-quick@wg0 2>/dev/null || printf unavailable)"
+            echo "strongswan_service=$(sudo systemctl is-active "${STRONGSWAN_SERVICE}" 2>/dev/null || printf unavailable)"
+            echo "dnsmasq_service=$(sudo systemctl is-active dnsmasq 2>/dev/null || printf unavailable)"
+          } > "${RUNNER_TEMP}/algo-diagnostics.txt"
+
+      - name: Upload sanitized diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: sanitized-diagnostics-${{ matrix.os }}-${{ matrix.vpn_type }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/algo-diagnostics.txt
+          retention-days: 7
+
+      - name: Remove ephemeral integration fixtures
+        if: always()
+        run: |
+          rm -f integration-test.cfg configs
+          rm -rf "${RUNNER_TEMP}/algo-configs"
+
+  docker-build-test:
+    name: Docker Image Build Test
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Build Algo Docker image
+        run: |
+          docker build -t algo:ci-test .
+
+      - name: Test Docker image
+        run: |
+          # Test that the image can run and show help
+          docker run --rm --entrypoint /bin/sh algo:ci-test -c "cd /algo && ./algo --help"
+
+          # Test that required binaries exist in the virtual environment
+          docker run --rm --entrypoint /bin/sh algo:ci-test -c "cd /algo && uv run which ansible"
+          docker run --rm --entrypoint /bin/sh algo:ci-test -c "which python3"
+          docker run --rm --entrypoint /bin/sh algo:ci-test -c "which rsync"
+
+      - name: Test Docker config validation
+        run: |
+          # Create a minimal valid config
+          mkdir -p test-data
+          cat > test-data/config.cfg << 'EOF'
+          users:
+            - test-user
+          cloud_providers:
+            ec2:
+              size: t3.micro
+              region: us-east-1
+          wireguard_enabled: true
+          ipsec_enabled: false
+          dns_encryption: true
+          algo_provider: ec2
+          EOF
+
+          # Test that config is readable
+          docker run --rm --entrypoint cat -v "$(pwd)/test-data:/data" algo:ci-test /data/config.cfg
+
+          echo "✓ Docker image built and basic tests passed"
